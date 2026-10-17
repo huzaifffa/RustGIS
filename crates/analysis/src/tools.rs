@@ -680,12 +680,21 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             if e.width() > 0.0 && e.height() > 0.0 { e } else { e.padded(0.05, 0.01) }
         }
         t => {
-            let v: Vec<f64> = t.split(',').filter_map(|x| x.trim().parse().ok()).filter(|x: &f64| x.is_finite()).collect();
-            let [x0, y0, x1, y1] = v[..] else { return Err("the extent is xmin,ymin,xmax,ymax".into()) };
+            // Every component must parse: dropping a bad one would shift the rest.
+            let v: Option<Vec<f64>> = t.split(',').map(|x| x.trim().parse().ok().filter(|x: &f64| x.is_finite())).collect();
+            let Some([x0, y0, x1, y1]) = v.as_deref().and_then(|v| <[f64; 4]>::try_from(v).ok()) else {
+                return Err("the extent is xmin,ymin,xmax,ymax".into());
+            };
             Extent::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
         }
     };
-    let cell = num(p, "pixelSize").filter(|c| *c > 0.0).unwrap_or((extent.width().max(extent.height()) / 300.0).max(1e-5));
+    // The automatic size only when none is given: a bad one is refused, not replaced.
+    let given = p.get("pixelSize").is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
+    let cell = match num(p, "pixelSize") {
+        Some(c) if c > 0.0 => c,
+        _ if given => return Err("the pixel size must be more than zero".into()),
+        _ => (extent.width().max(extent.height()) / 300.0).max(1e-5),
+    };
     let power = num(p, "power").unwrap_or(2.0);
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
     let r = crate::rasterops::idw(&pts, &extent, cell, power, 0, &name)?;
@@ -1009,7 +1018,15 @@ mod tests {
         assert!(d[12] < d[3], "south-west, by the 1, is below north-east, by the 2: {d:?}");
         // A text field gives no values; a bad extent or power is refused.
         assert!(crate::run("idwInterpolation", &m, &serde_json::json!({"input": "polys", "field": "k"})).is_err(), "text field");
-        for p in [serde_json::json!({"extent": "1,2,3"}), serde_json::json!({"power": -1})] {
+        for p in [
+            serde_json::json!({"extent": "1,2,3"}),
+            serde_json::json!({"extent": "0,bad,1,2,3"}),
+            serde_json::json!({"extent": "0,0,1,NaN"}),
+            serde_json::json!({"power": -1}),
+            serde_json::json!({"pixelSize": 0}),
+            serde_json::json!({"pixelSize": "-1"}),
+            serde_json::json!({"pixelSize": "x"}),
+        ] {
             let mut p = p;
             p["input"] = "pts".into();
             p["field"] = "v".into();

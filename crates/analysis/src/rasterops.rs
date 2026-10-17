@@ -673,6 +673,10 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         let row = &all.bands[0].data[50..60];
         assert!(row.iter().all(|v| (0.0..=10.0).contains(v)) && row[0] < 1e-3 && row[9] > 10.0 - 1e-3, "{row:?}");
+        // With every point, a far one still pulls each cell off the two near ones' value.
+        let pts = [(Coord::new(0.0, 0.0), 0.0), (Coord::new(1.0, 0.0), 0.0), (Coord::new(5.0, 0.0), 100.0)];
+        let all = idw(&pts, &Extent::new(0.0, -0.5, 1.0, 0.5), 0.1, 1.0, 0, "idw").unwrap_or_else(|e| panic!("{e}"));
+        assert!(all.bands[0].data.iter().all(|v| *v > 0.0 && *v < 100.0), "{:?}", all.bands[0].data);
         let p = profile(&r, 0, &[Coord::new(0.0005, 0.01), Coord::new(0.0195, 0.01)], 20);
         assert_eq!(p.len(), 20);
         assert!(p.last().and_then(|x| x.2).unwrap_or(0.0) > p[0].2.unwrap_or(0.0) + 150.0);
