@@ -1220,17 +1220,24 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         });
     }
     ui.add_space(8.0);
-    if ui.button(tl!("Delete Element")).clicked() {
-        let _ = app.run("layout.removeElement", json!({"layout": li, "element": id}));
-        app.layout.selected = None;
-    }
+    ui.horizontal(|ui| {
+        if ui.button(tl!("Duplicate")).on_hover_text(tl!("Copy this element (Ctrl+D, ⌘D on a Mac)")).clicked()
+            && let Ok(v) = app.run("layout.duplicateElement", json!({"layout": li, "element": id}))
+        {
+            app.layout.selected = v["element"].as_u64().and_then(|v| u32::try_from(v).ok());
+        }
+        if ui.button(tl!("Delete Element")).on_hover_text(tl!("Delete (or Backspace)")).clicked() {
+            let _ = app.run("layout.removeElement", json!({"layout": li, "element": id}));
+            app.layout.selected = None;
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::{RULER, landing, page_rect, resized, snap_to, to_screen};
     use crate::RustGisApp;
-    use egui::{Event, Modifiers, PointerButton, Pos2, Rect, vec2};
+    use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, vec2};
     use serde_json::json;
     use std::{cell::Cell, rc::Rc};
 
@@ -1378,6 +1385,52 @@ mod tests {
         h.run_steps(2);
         assert!(h.state().layout.frame_zoom.is_none());
         assert_eq!(h.state().session.revision, rev, "nothing was applied");
+    }
+
+    /// Ctrl+D (Cmd+D) duplicates the selected element and selects the copy; Backspace, the Mac's
+    /// delete key, deletes it.
+    #[test]
+    fn keys_duplicate_and_delete_the_selected_element() {
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Keys"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().clone();
+        app.layout.selected = Some(title.id);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                crate::chrome::shortcuts(app, &ctx);
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let key = |key, modifiers| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        let n = h.state().session.project.layouts[li].elements.len();
+
+        h.event(key(Key::D, Modifiers::COMMAND));
+        h.step();
+        let app = h.state();
+        let layout = &app.session.project.layouts[li];
+        assert_eq!(layout.elements.len(), n + 1, "Ctrl+D added a copy");
+        let copy = layout.element(app.layout.selected.unwrap()).unwrap();
+        assert_ne!(copy.id, title.id, "the copy is selected");
+        assert_eq!((copy.name.as_str(), copy.x, copy.y, copy.w), ("Title 2", title.x + 5.0, title.y + 5.0, title.w));
+        let copy = copy.id;
+
+        h.event(key(Key::Backspace, Modifiers::NONE));
+        h.step();
+        let app = h.state();
+        let layout = &app.session.project.layouts[li];
+        assert_eq!(layout.elements.len(), n, "Backspace deleted the copy");
+        assert!(layout.element(copy).is_none() && layout.element(title.id).is_some());
+        assert_eq!(app.layout.selected, None);
     }
 
     #[test]

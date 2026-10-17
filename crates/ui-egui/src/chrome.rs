@@ -378,6 +378,8 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
     // the box, not the tool.
     let typing = ctx.egui_wants_keyboard_input() || crate::searchbox::had_focus(&app.ui.search, ctx.cumulative_pass_nr());
     let cmd = Modifiers::COMMAND;
+    // An element selected in the open layout, for the layout's own keys.
+    let element = app.session.active_layout.is_some() && app.layout.selected.is_some();
     let mut run: Vec<(&str, Value)> = Vec::new();
     ctx.input_mut(|i| {
         for (m, k, id) in [
@@ -403,8 +405,12 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             if i.consume_key(Modifiers::NONE, Key::Escape) {
                 run.push(("tool.set", json!({"tool": "explore"})));
             }
-            if i.consume_key(Modifiers::NONE, Key::Delete) {
+            // A Mac keyboard's delete key is Backspace: it deletes a layout element too.
+            if i.consume_key(Modifiers::NONE, Key::Delete) || (element && i.consume_key(Modifiers::NONE, Key::Backspace)) {
                 run.push(("edit.delete", Value::Null));
+            }
+            if element && i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::D)) {
+                run.push(("layout.duplicateElement", Value::Null));
             }
             if i.consume_key(Modifiers::NONE, Key::Home) {
                 run.push(("map.zoomFull", Value::Null));
@@ -428,6 +434,15 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
                 app.ui.command_search = None;
                 continue;
             }
+        }
+        // Ctrl+D (Cmd+D on a Mac) duplicates the selected layout element and selects the copy.
+        if id == "layout.duplicateElement" {
+            if let (Some(li), Some(el)) = (app.session.active_layout, app.layout.selected)
+                && let Ok(v) = app.run(id, json!({"layout": li, "element": el}))
+            {
+                app.layout.selected = v["element"].as_u64().and_then(|v| u32::try_from(v).ok());
+            }
+            continue;
         }
         // With Edit Vertices, Delete removes the chosen vertex rather than the feature.
         if id == "edit.delete"

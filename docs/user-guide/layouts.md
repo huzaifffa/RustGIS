@@ -60,7 +60,9 @@ the maps; while one is open, its groups lead the Publish tab:
 - **Map Series**: one page per feature of an index layer, with the frame zoomed to each feature;
   step through pages, refresh, and export every page into one PDF.
 - Click an element to select it, drag to move, drag its handles to resize, and edit it in the
-  properties panel. The wheel zooms the page.
+  properties panel. The wheel zooms the page. **Delete** (or **Backspace**, the delete key on a
+  Mac) deletes the selected element, and **Ctrl+D** (**⌘D** on a Mac) duplicates it: the copy is
+  placed 5 mm down and to the right, on top, and selected.
 - **Rulers and guides**: rulers along the top and left show millimetres from the page's corner.
   Drag out of a ruler to add a guide, drag a guide to move it, and drag it back onto a ruler to
   remove it. Guides are saved with the layout but never printed or exported. **Clear Guides**

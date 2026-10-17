@@ -7030,6 +7030,34 @@ fn map_rename_names_any_map_and_what_shows_it_follows() {
 }
 
 #[test]
+fn layout_elements_duplicate_offset_on_top_and_undo() {
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "D"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let legend = s.project.layouts[li].elements.iter().find(|e| e.name == "Legend").unwrap().clone();
+    let r = s.run("layout.duplicateElement", &json!({"element": legend.id})).unwrap();
+    let id = r["element"].as_u64().unwrap() as u32;
+    let l = &s.project.layouts[li];
+    let copy = l.element(id).unwrap();
+    // A new id and name, the same kind and size, offset 5 mm, drawn on top.
+    assert_ne!(id, legend.id);
+    assert_eq!((copy.name.as_str(), copy.x, copy.y, copy.w, copy.h), ("Legend 2", legend.x + 5.0, legend.y + 5.0, legend.w, legend.h));
+    assert_eq!(copy.kind, legend.kind);
+    assert_eq!(l.elements.last().map(|e| e.id), Some(id));
+    // A given offset; the next copy takes the next free name.
+    let r = s.run("layout.duplicateElement", &json!({"element": legend.id, "dx": 0, "dy": -20})).unwrap();
+    assert_eq!(r["name"], "Legend 3");
+    let third = s.project.layouts[li].element(r["element"].as_u64().unwrap() as u32).unwrap();
+    assert_eq!((third.x, third.y), (legend.x, legend.y - 20.0));
+    for bad in [json!({}), json!({"element": 9999}), json!({"element": legend.id, "dx": 1e9})] {
+        assert!(s.run("layout.duplicateElement", &bad).is_err(), "{bad}");
+    }
+    s.run("edit.undo", &Value::Null).unwrap();
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert!(s.project.layouts[li].element(id).is_none(), "undone");
+}
+
+#[test]
 fn layout_guides_are_set_kept_and_undone() {
     let mut s = world();
     s.run("layout.new", &json!({"name": "G"})).unwrap();

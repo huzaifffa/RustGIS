@@ -90,6 +90,9 @@ pub fn commands() -> Vec<C> {
         C::new("layout.guides", "Guides", "Publish › Page Setup", guides).params(
             r#"{"layout"?, "x"?: [mm] (vertical guides, from the page's left edge), "y"?: [mm] (horizontal guides, from its top edge), "clear"?: bool (remove every guide first)}"#,
         ),
+        C::new("layout.duplicateElement", "Duplicate Element", "Publish › Element", duplicate_element).params(
+            r#"{"layout"?, "element": id, "dx"?, "dy"?: mm (offset of the copy, default 5)}"#,
+        ),
         C::new("layout.removeElement", "Delete Element", "Publish › Element", |s, p| {
             let id = element_id(p)?;
             let l = active(s, p)?;
@@ -304,6 +307,23 @@ fn guides(s: &mut Session, p: &Value) -> CmdResult {
         l.guides.y = y;
     }
     Ok(json!({"x": l.guides.x, "y": l.guides.y}))
+}
+
+/// Copies an element, offset a little so the copy shows, on top of the others.
+fn duplicate_element(s: &mut Session, p: &Value) -> CmdResult {
+    let id = element_id(p)?;
+    let (dx, dy) = (f(p, "dx").unwrap_or(5.0), f(p, "dy").unwrap_or(5.0));
+    if dx.abs() > 5000.0 || dy.abs() > 5000.0 {
+        return Err("the copy's offset is up to 5000 mm".into());
+    }
+    let l = active(s, p)?;
+    let e = l.element(id).cloned().ok_or_else(|| format!("no element {id}"))?;
+    let name = numbered(&e.name, |n| l.elements.iter().any(|x| x.name == n));
+    let copy = l.add(name.clone(), (e.x + dx, e.y + dy, e.w, e.h), e.kind);
+    if let Some(c) = l.element_mut(copy) {
+        c.visible = e.visible;
+    }
+    Ok(json!({"element": copy, "name": name}))
 }
 
 /// The element's box: given values, else a default inside the page.
