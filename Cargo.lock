@@ -4023,6 +4023,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "ureq",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -4211,6 +4212,7 @@ dependencies = [
  "rustgis-assistant",
  "rustgis-engine",
  "rustgis-plugins",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "sys-locale",

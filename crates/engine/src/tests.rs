@@ -1117,16 +1117,22 @@ fn layer_class_style_edits_one_class() {
     let mut s = world();
     s.run("layer.symbology", &json!({"layer": "Countries", "type": "unique", "field": "income_grp"})).unwrap();
     let renderer = |s: &Session| s.map().layer_by_name("Countries").unwrap().renderer.clone();
-    // Legend rows are sorted by label (#218), so the edited class is found by its label.
     let value = renderer(&s).legend().into_iter().next().unwrap().label;
+    // Legend rows are sorted by label (#218), so a renamed class moves: find its row from its
+    // value, not its label, so an edit landing on another class can't pass.
     let class = |s: &Session| {
-        let rows = renderer(s).legend();
-        rows.iter().find(|e| e.label == "Rich").or_else(|| rows.iter().find(|e| e.label == value)).cloned().unwrap()
+        let r = renderer(s);
+        let rustgis_map::Renderer::Unique { classes, .. } = &r else { panic!("unique renderer expected") };
+        let i = classes.iter().position(|(k, _)| *k == value).unwrap();
+        let row = r.class_order().into_iter().position(|o| o == i).unwrap();
+        r.legend().into_iter().nth(row).unwrap()
     };
     let r = s.run("layer.classStyle", &json!({"layer": "Countries", "value": value, "color": "#123456", "label": "Rich"})).unwrap();
     assert_eq!(r["label"], "Rich");
     assert!(r["color"].as_str().is_some_and(|c| c.starts_with("#123456")), "{r}");
     assert_eq!(class(&s).label, "Rich");
+    // The renamed class sorts to a new legend row and keeps its own colour there.
+    assert!(class(&s).symbol.fill.hex().starts_with("#123456"), "{:?}", class(&s));
     // One undo step, as every command is.
     s.run("edit.undo", &Value::Null).unwrap();
     assert_eq!(class(&s).label, value);
@@ -6716,4 +6722,19 @@ fn layer_color_honours_an_explicit_fill_alpha() {
     s.run("layer.color", &json!({"layer": "Countries", "color": "#33669940"})).unwrap();
     s.run("layer.color", &json!({"layer": "Countries", "color": "#996633"})).unwrap();
     assert_eq!(alpha(&s), 150);
+}
+
+#[test]
+fn buffer_point_adds_only_the_buffer() {
+    let mut s = world();
+    let before = s.map().layers.len();
+    let v =
+        s.run("gp.bufferPoint", &json!({"lon": 2.35, "lat": 48.85, "distance": 1, "units": "Kilometers", "name": "Buffer 1 km"})).unwrap();
+    assert_eq!(s.map().layers.len(), before + 1, "the clicked point isn't added");
+    let l = s.map().layer(v["layer"].as_u64().unwrap() as u32).unwrap();
+    assert_eq!(l.name, "Buffer 1 km");
+    let e = l.dataset.extent();
+    assert!((e.max_y - e.min_y - 2.0 / 111.2).abs() < 0.002, "a 1 km radius: {e:?}");
+    assert!(s.run("gp.bufferPoint", &json!({"lon": 200, "lat": 0, "distance": 1})).is_err());
+    assert!(s.run("gp.bufferPoint", &json!({"lon": 0, "lat": 0})).is_err());
 }

@@ -40,7 +40,7 @@ use serde_json::{Value, json};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage:\n  rustgis-cli commands | tools\n  rustgis-cli plugins [install <file|folder> | uninstall <id> | enable <id> | disable <id> | browse | get <id> | prepare <id>] [--registry URL]\n  rustgis-cli info <data>\n  rustgis-cli logo <out.png|out.ico|out.bmp> [--size N] [--canvas WxH --at X,Y (.bmp only)]\n  rustgis-cli render <data|project> <out.png> [--basemap NAME] [--tiles URL] [--width N] [--height N] [--dpi N] [--worldview auto|default|china]\n  rustgis-cli run [--sample] [--project P] [--data F]… --cmd 'id={{json}}'… [--save P] [--worldview auto|default|china]\n  rustgis-cli ask [--sample] [--project P] [--data F]… \"request\" [--provider P] [--model M] [--base-url URL] [--yes] [--save P]\n  rustgis-cli ask --models [--provider P]\n  rustgis-cli ask --login [--another-account] [--account CLIENT_ID] | --logout\n  rustgis-cli ask --accounts | --account CLIENT_ID\n  rustgis-cli mcp [--sample] [--project P] [--data F]… [--yes] [--attach [PORT]]"
+        "usage:\n  rustgis-cli commands | tools\n  rustgis-cli plugins [install <file|folder> | uninstall <id> | enable <id> | disable <id> | browse | get <id> | prepare <id>] [--registry URL]\n  rustgis-cli skills [add <SKILL.md|folder|.zip> | remove <name> | enable <name> | disable <name>]\n  rustgis-cli info <data>\n  rustgis-cli logo <out.png|out.ico|out.bmp> [--size N] [--canvas WxH --at X,Y (.bmp only)]\n  rustgis-cli render <data|project> <out.png> [--basemap NAME] [--tiles URL] [--width N] [--height N] [--dpi N] [--worldview auto|default|china]\n  rustgis-cli run [--sample] [--project P] [--data F]… --cmd 'id={{json}}'… [--save P] [--worldview auto|default|china]\n  rustgis-cli ask [--sample] [--project P] [--data F]… \"request\" [--provider P] [--model M] [--base-url URL] [--yes] [--save P]\n  rustgis-cli ask --models [--provider P]\n  rustgis-cli ask --login [--another-account] [--account CLIENT_ID] | --logout\n  rustgis-cli ask --accounts | --account CLIENT_ID\n  rustgis-cli mcp [--sample] [--project P] [--data F]… [--yes] [--attach [PORT] [--token-file FILE]]"
     );
     ExitCode::from(2)
 }
@@ -102,6 +102,48 @@ fn open_inputs(s: &mut Session, args: &[String]) -> Result<(), String> {
         {
             load(s, p)?;
         }
+    }
+    Ok(())
+}
+
+/// `skills`: the assistant's skills, and adding, removing and switching them (see
+/// `rustgis_assistant::skills`).
+fn skills(args: &[String]) -> Result<(), String> {
+    use rustgis_assistant::skills::{self, Places, Source};
+    let places = Places::here();
+    let arg = |what: &str| args.get(2).filter(|a| !a.starts_with("--")).cloned().ok_or(format!("skills {what} needs an argument"));
+    match args.get(1).map(String::as_str) {
+        None | Some("list") => {
+            let (listed, problems) = skills::list(&places);
+            for p in problems {
+                eprintln!("rustgis-cli: {p}");
+            }
+            let rows: Vec<Value> = listed
+                .iter()
+                .map(|l| {
+                    let (source, folder) = match &l.skill.source {
+                        Source::BuiltIn => ("built-in", None),
+                        Source::Plugin(_) => ("plugin", None),
+                        Source::User(d) => ("user", Some(d.display().to_string())),
+                        Source::Shared(d) => ("shared", Some(d.display().to_string())),
+                    };
+                    json!({"name": l.skill.name, "description": l.skill.description, "source": source, "folder": folder, "on": l.on})
+                })
+                .collect();
+            print(&json!(rows));
+        }
+        Some("add") => print(&json!({"added": skills::add(&places, std::path::Path::new(&arg("add")?))?})),
+        Some("remove") => {
+            let name = arg("remove")?;
+            skills::remove(&places, &name)?;
+            print(&json!({"removed": name}));
+        }
+        Some(on @ ("enable" | "disable")) => {
+            let name = arg(on)?;
+            skills::set_enabled(&places, &name, on == "enable")?;
+            print(&json!({"name": name, "on": on == "enable"}));
+        }
+        Some(other) => return Err(format!("unknown skills subcommand '{other}'")),
     }
     Ok(())
 }
@@ -209,7 +251,7 @@ fn ask(s: &mut Session, args: &[String]) -> Result<(), String> {
     let login = cfg.login().then(|| cfg.binding());
     let signed_in = login.is_some();
     let transport = move |req: &rustgis_assistant::HttpRequest| match &login {
-        Some(account) => rustgis_assistant::chatgpt::send(req, account).map_err(String::from),
+        Some(account) => rustgis_assistant::chatgpt::send(req, account),
         None => http::send(req),
     };
     if signed_in && !args.iter().any(|a| a == "--models") && prompt.is_some() {
@@ -249,6 +291,7 @@ fn ask(s: &mut Session, args: &[String]) -> Result<(), String> {
     eprintln!("[{} · {}]", cfg.provider, cfg.model);
     let yes = args.iter().any(|a| a == "--yes");
     let mut a = Agent::new(cfg, s);
+    a.set_skills(rustgis_assistant::skills::installed());
     let mut shown = 0;
     let mut show = |a: &Agent| {
         for e in a.transcript.iter().skip(shown) {
@@ -272,7 +315,7 @@ fn ask(s: &mut Session, args: &[String]) -> Result<(), String> {
         if let Some(path) = &trace {
             let resp = match &r {
                 Ok(r) => format!("HTTP {}\n{}", r.status, String::from_utf8_lossy(&r.body)),
-                Err(e) => e.clone(),
+                Err(e) => e.to_string(),
             };
             let entry = format!("> {} {}\n{}\n< {resp}\n\n", req.method, req.url, req.body.as_deref().unwrap_or(""));
             let written = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(entry.as_bytes()));
@@ -313,10 +356,14 @@ fn attach_port(args: &[String]) -> Result<Option<u16>, String> {
 /// app's session runs the calls (its MCP Relay command started the listener on 127.0.0.1); this
 /// process relays the protocol only. `--yes` goes along with the connection, so the app applies
 /// the same file and network refusals as the private server does here.
-fn attach(port: u16, allow_access: bool) -> Result<(), String> {
+fn attach(port: u16, allow_access: bool, token_file: Option<&str>) -> Result<(), String> {
     // The relay wrote the run's token where only this user can read it; carrying it in the
-    // attach message is what proves this is the user's own client, so nothing is pasted.
-    let token = rustgis_assistant::relay::read_token(port)?;
+    // attach message is what proves this is the user's own client, so nothing is pasted. An
+    // agent the app starts itself gets a token file of its own (`--token-file`).
+    let token = match token_file {
+        Some(f) => rustgis_assistant::relay::read_token_file(std::path::Path::new(f))?,
+        None => rustgis_assistant::relay::read_token(port)?,
+    };
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
         .map_err(|e| format!("nothing is listening on 127.0.0.1:{port} ({e}); start RustGIS's MCP Relay command first"))?;
     let hello = json!({"jsonrpc": "2.0", "method": "rustgis/attach", "params": {"access": allow_access, "token": token}});
@@ -375,9 +422,10 @@ fn mcp(s: &mut Session, args: &[String]) -> Result<(), String> {
         if args.iter().any(|a| matches!(a.as_str(), "--sample" | "--project" | "--data")) {
             return Err("mcp --attach manages the project open in the app; --sample, --project and --data make a private one".into());
         }
-        return attach(port, allow_access);
+        return attach(port, allow_access, opt(args, "--token-file"));
     }
-    let server = rustgis_assistant::mcp::Server::new(allow_access);
+    let mut server = rustgis_assistant::mcp::Server::new(allow_access);
+    server.skills = rustgis_assistant::skills::installed();
     eprintln!(
         "rustgis-cli: MCP server ready ({} layers; file and network access {})",
         s.map().layers.len(),
@@ -478,6 +526,7 @@ fn main() -> ExitCode {
             print(&out);
             Ok(())
         }
+        "skills" => skills(&args),
         "commands" => {
             print(&run(&mut s, "info.commands", Value::Null)?);
             Ok(())

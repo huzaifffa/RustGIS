@@ -8,7 +8,8 @@ projection, bookmarks and view settings. Maps open as tabs above the map view.
 Drag to pan and scroll to zoom; ++home++ (or **Full Extent**) shows all the data. **Map ›
 Navigate** has fixed zoom steps, **Previous** and **Next** extents, **Bookmarks** (the World Atlas
 has World, Europe, Africa, Americas and East Asia) and **Go To XY**, which pans to a longitude and
-latitude. The Bookmarks menu removes a bookmark with the button beside it, and exports or imports
+latitude. **New Bookmark…** saves the current view under a name, with an optional description of
+the place. The Bookmarks menu removes a bookmark with the button beside it, and exports or imports
 them as a `.rgisbookmarks` file. Imported bookmarks show the same place on a map in another
 projection; places that projection can't show are skipped. Type a scale in the status bar to jump
 to it. More navigation tools are under [View
@@ -41,6 +42,15 @@ the command line or a script, and goes to a hit with `"go"`:
 ```
 rustgis-cli run --sample --cmd 'map.search={"query":"Tokyo","go":true}'
 ```
+
+**Right-click the map** for a menu about that place. Its first row shows the latitude and
+longitude; click it to copy them. Below it, **Copy As GeoJSON** copies the place as a point
+feature, **Center Map Here** and **Zoom In Here** move the view, and **Directions To Here** and
+**Directions From Here** open the [Directions](#directions) pane. **Quick Analysis** runs a tool
+at the place: a buffer of 500 m, 1 km or 5 km (¼, 1 or 5 miles when the Directions pane is set
+to miles; `gp.bufferPoint`), a viewshed of 2, 5 or 15 km or a line of sight on an elevation
+raster in the map, and **Open In Geoprocessing…** opens the Buffer tool. **View In Google Maps**
+and **View In Google Earth** open the place in your browser at about the same zoom.
 
 ### Directions
 
