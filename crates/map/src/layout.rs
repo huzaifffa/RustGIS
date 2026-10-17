@@ -234,6 +234,26 @@ fn margin() -> f64 {
     0.1
 }
 
+/// Most guides a layout keeps in each direction.
+pub const MAX_GUIDES: usize = 64;
+
+/// Ruler guides for lining elements up: never printed or exported.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Guides {
+    /// Vertical guides, at these distances from the page's left edge (mm).
+    #[serde(default)]
+    pub x: Vec<f64>,
+    /// Horizontal guides, at these distances from the page's top edge (mm).
+    #[serde(default)]
+    pub y: Vec<f64>,
+}
+
+impl Guides {
+    pub fn is_empty(&self) -> bool {
+        self.x.is_empty() && self.y.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     pub name: String,
@@ -242,13 +262,15 @@ pub struct Layout {
     pub elements: Vec<Element>,
     #[serde(default)]
     pub series: Option<MapSeries>,
+    #[serde(default, skip_serializing_if = "Guides::is_empty")]
+    pub guides: Guides,
     #[serde(default)]
     next_id: u32,
 }
 
 impl Layout {
     pub fn new(name: impl Into<String>, width: f64, height: f64) -> Self {
-        Layout { name: name.into(), width, height, elements: Vec::new(), series: None, next_id: 1 }
+        Layout { name: name.into(), width, height, elements: Vec::new(), series: None, guides: Guides::default(), next_id: 1 }
     }
 
     /// Adds an element and returns its id.

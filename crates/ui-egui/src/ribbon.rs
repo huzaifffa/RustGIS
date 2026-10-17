@@ -2449,6 +2449,30 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 }
             }
         });
+        col(ui, |ui| {
+            let snap = !app.layout.no_snap;
+            let desc = "Snap elements to guides, the page and each other as you move or resize them. Hold Alt to place one freely.";
+            if small(ui, app, "keep_tool", "Snap", desc, "ui.menu", Value::Null, snap).clicked() {
+                app.layout.no_snap = snap;
+            }
+            let shown = !app.layout.no_rulers;
+            let desc = "Show rulers. Drag from a ruler to add a guide; drag a guide back onto it to remove it.";
+            if small(ui, app, "measure", "Rulers", desc, "ui.menu", Value::Null, shown).clicked() {
+                app.layout.no_rulers = shown;
+            }
+            if !layout.guides.is_empty() {
+                small(
+                    ui,
+                    app,
+                    "delete",
+                    "Clear Guides",
+                    "Remove every guide from this layout.",
+                    "layout.guides",
+                    json!({"layout": li, "clear": true}),
+                    false,
+                );
+            }
+        });
     });
     group(ui, "Map Frames", |ui| {
         big_menu(ui, app, "map", "Map\nFrame", "Add a map frame showing a map of the project.", |ui, app| {
