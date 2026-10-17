@@ -322,6 +322,11 @@ impl Layout {
     pub fn clamp(&mut self) {
         self.width = finite_or(self.width, 210.0).clamp(20.0, 5000.0);
         self.height = finite_or(self.height, 297.0).clamp(20.0, 5000.0);
+        // The same limits `layout.guides` sets: the view walks these lists every frame.
+        for list in [&mut self.guides.x, &mut self.guides.y] {
+            list.retain(|v| v.is_finite() && v.abs() <= 5000.0);
+            list.truncate(MAX_GUIDES);
+        }
         self.elements.truncate(500);
         let mut seen = std::collections::HashSet::new();
         let mut next = self.elements.iter().map(|e| e.id).filter(|id| *id <= MAX_ID).max().unwrap_or(0).saturating_add(1);
@@ -554,5 +559,15 @@ mod tests {
         let ids: std::collections::HashSet<u32> = l.elements.iter().map(|e| e.id).collect();
         assert_eq!(ids.len(), 3, "the box got a fresh id");
         assert!(matches!(l.element(2).map(|e| &e.kind), Some(ElementKind::NorthArrow { frame: 1 })));
+    }
+
+    #[test]
+    fn loaded_guides_are_limited() {
+        let mut l = Layout::new("Layout", 297.0, 210.0);
+        l.guides.x = (0..200).map(f64::from).collect();
+        l.guides.y = vec![f64::NAN, 1e9, -20.0, f64::INFINITY, 50.0];
+        l.clamp();
+        assert_eq!(l.guides.x.len(), MAX_GUIDES);
+        assert_eq!(l.guides.y, vec![-20.0, 50.0]);
     }
 }
