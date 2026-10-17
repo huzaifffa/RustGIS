@@ -688,14 +688,18 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             Extent::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
         }
     };
-    // The automatic size only when none is given: a bad one is refused, not replaced.
-    let given = p.get("pixelSize").is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
+    // Defaults only when a value is not given: a bad one is refused, not replaced.
+    let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
     let cell = match num(p, "pixelSize") {
         Some(c) if c > 0.0 => c,
-        _ if given => return Err("the pixel size must be more than zero".into()),
-        _ => (extent.width().max(extent.height()) / 300.0).max(1e-5),
+        _ if given("pixelSize") => return Err("the pixel size must be more than zero".into()),
+        _ => idw_auto_cell(&extent, pts.len()),
     };
-    let power = num(p, "power").unwrap_or(2.0);
+    let power = match num(p, "power") {
+        Some(v) => v,
+        None if given("power") => return Err("the distance coefficient must be a number".into()),
+        None => 2.0,
+    };
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
     let r = crate::rasterops::idw(&pts, &extent, cell, power, 0, &name)?;
     let bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
@@ -704,6 +708,20 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         output: Output::Layers(vec![OutputLayer::Raster { file_name: format!("{name}.tif"), name, bytes }]),
         messages: vec![msg],
     })
+}
+
+/// The automatic IDW cell size: 300 cells across the extent, coarsened until every cell weighing
+/// every one of `n` points stays within the interpolation's work limit.
+fn idw_auto_cell(extent: &Extent, n: usize) -> f64 {
+    let mut cell = (extent.width().max(extent.height()) / 300.0).max(1e-5);
+    let cells = |c: f64| ((extent.width() / c).ceil().max(1.0) * (extent.height() / c).ceil().max(1.0)) as usize;
+    for _ in 0..200 {
+        if cells(cell).saturating_mul(n) <= crate::rasterops::MAX_IDW_WORK {
+            break;
+        }
+        cell *= 1.1;
+    }
+    cell
 }
 
 fn count_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -1023,6 +1041,7 @@ mod tests {
             serde_json::json!({"extent": "0,bad,1,2,3"}),
             serde_json::json!({"extent": "0,0,1,NaN"}),
             serde_json::json!({"power": -1}),
+            serde_json::json!({"power": "x"}),
             serde_json::json!({"pixelSize": 0}),
             serde_json::json!({"pixelSize": "-1"}),
             serde_json::json!({"pixelSize": "x"}),
@@ -1031,6 +1050,17 @@ mod tests {
             p["input"] = "pts".into();
             p["field"] = "v".into();
             assert!(crate::run("idwInterpolation", &m, &p).is_err(), "{p}");
+        }
+    }
+
+    #[test]
+    fn idw_auto_cell_stays_within_the_work_limit() {
+        let e = Extent::new(0.0, 0.0, 3.0, 3.0);
+        assert!((idw_auto_cell(&e, 10) - 0.01).abs() < 1e-12, "few points keep 300 cells across");
+        for n in [5_000, 50_000, 1_000_000] {
+            let c = idw_auto_cell(&e, n);
+            let cells = ((3.0 / c).ceil() * (3.0 / c).ceil()) as usize;
+            assert!(cells * n <= crate::rasterops::MAX_IDW_WORK, "{n} points: {cells} cells of {c}");
         }
     }
 

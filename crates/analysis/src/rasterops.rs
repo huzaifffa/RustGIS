@@ -272,7 +272,7 @@ pub fn line_of_sight(
 /// Most ray steps a viewshed takes, and cell-point pairs an interpolation weighs (each about a
 /// second or two).
 const MAX_VIEWSHED_WORK: i64 = 400_000_000;
-const MAX_IDW_WORK: usize = 400_000_000;
+pub(crate) const MAX_IDW_WORK: usize = 400_000_000;
 
 /// Cells visible from an observer (1) or not (0) within `radius_m`; outside the radius no-data.
 pub fn viewshed(r: &Raster, b: usize, observer: Coord, height: f64, radius_m: f64) -> Result<Vec<f32>, String> {
