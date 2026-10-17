@@ -381,16 +381,27 @@ impl Renderer {
         v
     }
 
+    /// The order `legend()` lists the Unique Values classes in: their indices in `classes`,
+    /// sorted by label without regard to case (a stable sort, so a repeated value keeps its first
+    /// class first). Empty for the other renderers, whose legend follows their classes.
+    pub fn class_order(&self) -> Vec<usize> {
+        let Renderer::Unique { classes, class_labels, .. } = self else { return Vec::new() };
+        let mut order: Vec<usize> = (0..classes.len()).collect();
+        order.sort_by_cached_key(|i| classes.get(*i).map(|(k, _)| unique_label(class_labels, k).to_lowercase()));
+        order
+    }
+
     pub fn legend(&self) -> Vec<LegendEntry> {
         match self {
             Renderer::Single(_) => Vec::new(),
             Renderer::Unique { classes, other, class_labels, other_label, .. } => {
-                let mut v: Vec<LegendEntry> = classes
-                    .iter()
+                // Keep symbols attached to their sorted labels and the fallback at the end.
+                let mut v: Vec<LegendEntry> = self
+                    .class_order()
+                    .into_iter()
+                    .filter_map(|i| classes.get(i))
                     .map(|(k, s)| LegendEntry { label: unique_label(class_labels, k), symbol: *s, fallback: false })
                     .collect();
-                // Keep symbols attached to their sorted labels and the fallback at the end.
-                v.sort_by_cached_key(|e| e.label.to_lowercase());
                 v.push(LegendEntry { label: other_label.clone().unwrap_or_else(|| OTHER_VALUES.into()), symbol: *other, fallback: true });
                 v
             }
@@ -455,7 +466,8 @@ impl Renderer {
                 s.stroke = c;
             }
         };
-        // The class's row in `legend()`, which lists the classes in order and then `other`.
+        // The class's index, then its row in `legend()`, which lists the Unique Values classes
+        // sorted by label (`class_order`) and then `other`.
         let row = match (&mut *self, class) {
             (Renderer::Unique { classes, class_labels, .. }, ClassRef::Value(v)) => {
                 let i = classes.iter().position(|(k, _)| k == v).ok_or_else(|| format!("no class with the value '{v}'"))?;
@@ -504,6 +516,10 @@ impl Renderer {
             }
             (Renderer::Graduated { .. }, _) => return Err("Graduated Colors classes are numbered from 0, the lowest".into()),
             _ => return Err("only Unique Values and Graduated Colors have classes to style".into()),
+        };
+        let row = match class {
+            ClassRef::Value(_) => self.class_order().iter().position(|i| *i == row).unwrap_or(row),
+            _ => row,
         };
         self.legend().into_iter().nth(row).ok_or_else(|| "the class has no legend row".into())
     }
