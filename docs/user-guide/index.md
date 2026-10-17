@@ -41,7 +41,11 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
   right.
 - **Panes** (right): Catalog, Geoprocessing, Symbology, History, Details, Editing, Workflows,
   Script, the AI Assistant and more. Open them from **View › Windows** or the commands that use
-  them.
+  them. Each pane opened gets a tab at the top, in the order opened: click a tab to show its pane,
+  and its **✕** to close it (the next tab shows; closing the last hides the side). Right-click a
+  tab to close it, the others or all; the **✕** at the header's end closes every pane. Tabs that
+  don't fit are listed under **»**. A ribbon button for a pane shows it when it is open but not in view,
+  and closes it when it is. **Pane Sets** keep the tabs open.
 - **Status bar**: the scale (type one, or pick from the list), the coordinate system (click it to
   change the projection), the pointer's coordinates (click them to switch between decimal
   degrees and DMS), the selection count and the draw time.
@@ -66,7 +70,7 @@ ribbon, arrows at its ends scroll it.
 | **View** | Display, View (Globe, Projection, Global, Local), Effects, Scene, Windows, Labeling, Navigation, Link, Workspace, Animation, Profile |
 | **Publish** | While a layout is open, its groups first (Page, Map Frames, Map Surrounds, Text, Export); then Report, Presentation, Output (Export Map, Print, Capture), Package, Share As, Layout, Save As, Thumbnail |
 | **Plugins** | The Plugin Manager, plus a tab for each [plugin](../plugins.md) that adds one |
-| **Settings** | Customize (ribbon tabs, Quick Access Toolbar), Language (interface language and worldview), Start-up (start with the sample or a blank map, projection, extent) |
+| **Settings** | Customize (ribbon tabs, Quick Access Toolbar), Language (interface language and worldview), Start-up (start with the sample, a blank map, the last project or one you choose, projection, extent) |
 | **Help** | Performance (Diagnostic Monitor), Learn, Help (About, Check for Updates on the desktop, Command Search, Shortcuts) |
 
 The tabs stay the same whatever is selected: Style and Data act on the layer selected in Layers.

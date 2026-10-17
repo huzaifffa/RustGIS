@@ -51,6 +51,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a request waits for the app to run it; after that it is cancelled.
 const REPLY_WAIT: Duration = Duration::from_secs(60);
+/// How long a request waits for the user's approval before it is cancelled.
+const APPROVAL_WAIT: Duration = Duration::from_secs(15 * 60);
 /// How often the listener, a connection waiting for a reply, and a connection waiting for its
 /// client's next line check whether the relay was stopped.
 const STOP_POLL: Duration = Duration::from_millis(25);
@@ -68,10 +70,31 @@ const CANCELLED: u8 = 2;
 
 /// A queued message: its line, what its connection allows, where its reply goes, and its state.
 struct Request {
+    /// A positive preflight is cached while this exact message waits for a decision.
+    approval_required: bool,
+    /// Set while it waits for the user's approval, so its connection waits for the user
+    /// ([`APPROVAL_WAIT`]) rather than for the app ([`REPLY_WAIT`]).
+    held: Arc<AtomicBool>,
+    id: u64,
+    decision: Arc<AtomicU8>,
     line: String,
-    allow_access: bool,
+    /// The token its connection attached with and whether it asked for file and network access
+    /// (`--yes`): what it may do is decided when it runs, so a revoked grant or the app's changed
+    /// setting applies to requests already queued.
+    token: String,
+    asked: bool,
     reply: SyncSender<Option<String>>,
     state: Arc<AtomicU8>,
+}
+
+/// A RustGIS-side approval, scoped to one exact MCP message and one run's grant.
+#[derive(Clone)]
+pub struct Approval {
+    pub id: u64,
+    pub summary: String,
+    token: String,
+    state: Arc<AtomicU8>,
+    decision: Arc<AtomicU8>,
 }
 
 /// State shared by the owner, the accept loop and the connections. It never refers back to the
@@ -95,6 +118,22 @@ struct Shared {
     attached: AtomicUsize,
     /// How long a request waits for the app before it is cancelled.
     reply_wait: Duration,
+    /// The port, naming the grants' token files.
+    port: u16,
+    /// The app lets agents attached with the relay's own token use files and the network, whether
+    /// or not they asked (`--yes`): the user turned agents on in the app ([`Relay::set_allow_access`]).
+    allow_access: AtomicBool,
+    /// Run-scoped tokens and what each allows ([`Relay::grant`]), by token.
+    grants: Mutex<HashMap<String, (bool, PathBuf)>>,
+    /// Local-agent grants require RustGIS approval unless their explicit auto setting is on.
+    reviewed: Mutex<HashMap<String, bool>>,
+    approvals: Mutex<Vec<Approval>>,
+    /// The connections attached with a grant, by connection id, so revoking it closes them.
+    granted: Mutex<HashMap<u64, String>>,
+    grant_ids: AtomicU64,
+    /// This run's own id (random, not secret), naming its grants' files: a grant left over from an
+    /// earlier run on the same port can't remove a file of this one.
+    run_id: String,
 }
 
 impl Shared {
@@ -116,12 +155,86 @@ impl Shared {
         for stream in streams {
             let _ = stream.shutdown(Shutdown::Both);
         }
+        lock(&self.approvals).clear();
         // Pending requests are cancelled before they are dropped, so none can run after stop.
         for req in lock(&self.requests).drain(..) {
             let _ = req.state.compare_exchange(PENDING, CANCELLED, SeqCst, SeqCst);
         }
         let _ = std::fs::remove_file(&self.token_file);
+        for (_, (_, file)) in lock(&self.grants).drain() {
+            let _ = std::fs::remove_file(&file);
+        }
         self.notify();
+    }
+
+    /// Whether a connection attached with `token` may use files and the network, given whether
+    /// it asked (`--yes`): the relay's own token as it asked, or always when the app allows it; a
+    /// grant as the grant says. `None` for a token that isn't (or is no longer) valid.
+    fn access(&self, token: &str, asked: bool) -> Option<bool> {
+        if same_token(token, &self.token) {
+            return Some(asked || self.allow_access.load(SeqCst));
+        }
+        lock(&self.grants).iter().find(|(t, _)| same_token(token, t)).map(|(_, (access, _))| *access)
+    }
+}
+
+/// A run-scoped token ([`Relay::grant`]): its file, for `rustgis-cli mcp --attach PORT
+/// --token-file FILE`. Dropping it revokes the token, removes the file and closes the
+/// connections that attached with it.
+pub struct Grant {
+    token: String,
+    file: PathBuf,
+    shared: std::sync::Weak<Shared>,
+}
+
+impl Grant {
+    /// Updates the opt-in automatic approval policy for this run only.
+    pub fn set_auto(&self, auto: bool) {
+        if let Some(shared) = self.shared.upgrade()
+            && let Some(value) = lock(&shared.reviewed).get_mut(&self.token)
+        {
+            *value = auto;
+        }
+    }
+
+    pub fn pending(&self) -> Vec<Approval> {
+        let Some(shared) = self.shared.upgrade() else { return Vec::new() };
+        lock(&shared.approvals)
+            .iter()
+            .filter(|a| a.token == self.token && a.state.load(SeqCst) == PENDING && a.decision.load(SeqCst) == PENDING)
+            .cloned()
+            .collect()
+    }
+
+    /// The id belongs to this grant, and an expired/revoked request can never be revived.
+    pub fn decide(&self, id: u64, allow: bool) {
+        let Some(shared) = self.shared.upgrade() else { return };
+        for a in lock(&shared.approvals).iter().filter(|a| a.token == self.token && a.id == id && a.state.load(SeqCst) == PENDING) {
+            let _ = a.decision.compare_exchange(PENDING, if allow { RUNNING } else { CANCELLED }, SeqCst, SeqCst);
+        }
+        shared.notify();
+    }
+
+    /// The token's file, private to this user.
+    pub fn token_file(&self) -> &std::path::Path {
+        &self.file
+    }
+}
+
+impl Drop for Grant {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.file);
+        let Some(shared) = self.shared.upgrade() else { return };
+        lock(&shared.grants).remove(&self.token);
+        lock(&shared.reviewed).remove(&self.token);
+        lock(&shared.approvals).retain(|a| a.token != self.token);
+        let ids: Vec<u64> = lock(&shared.granted).iter().filter(|(_, t)| **t == self.token).map(|(id, _)| *id).collect();
+        let streams = lock(&shared.streams);
+        for id in ids {
+            if let Some(stream) = streams.get(&id) {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
     }
 }
 
@@ -181,17 +294,22 @@ pub fn token_path(port: u16) -> PathBuf {
 /// and file must be this user's: a regular file, not a symlink, both owned by the user running
 /// this process, and private to that user (no group or other access).
 pub fn read_token(port: u16) -> Result<String, String> {
-    let path = token_path(port);
-    let hint = "start the MCP relay in the app (command palette: ui.mcpRelay) first";
-    let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("{}: {e} ({hint})", path.display()))?;
+    read_token_file(&token_path(port))
+}
+
+/// Reads a token file the relay wrote: its own ([`token_path`]) or a grant's
+/// ([`Grant::token_file`]), with the same checks as [`read_token`].
+pub fn read_token_file(path: &std::path::Path) -> Result<String, String> {
+    let hint = "check the token file path (--token-file) and whether its relay or grant is still active";
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e} ({hint})", path.display()))?;
     if !meta.is_file() || meta.len() > 1024 {
         return Err(format!("{}: not a token file; refused", path.display()));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir = token_dir();
-        let dir_meta = std::fs::symlink_metadata(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+        let dir_meta = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let me = rustix::process::geteuid().as_raw();
         if !dir_meta.is_dir() || dir_meta.uid() != me || meta.uid() != me {
             return Err(format!("{}: not owned by this user; refused", path.display()));
@@ -200,7 +318,7 @@ pub fn read_token(port: u16) -> Result<String, String> {
             return Err(format!("{}: readable by others; refused", path.display()));
         }
     }
-    let token = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let token = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let token = token.trim();
     if token.is_empty() {
         return Err(format!("{}: holds no token ({hint})", path.display()));
@@ -252,8 +370,13 @@ fn random_token() -> Result<String, String> {
 /// returns its path. A previous run's file (or a symlink in its place) is replaced, never
 /// written through.
 fn write_token_file(port: u16, token: &str) -> Result<PathBuf, String> {
+    write_private(&format!("{port}.token"), token)
+}
+
+/// Writes `token` to the file `name` in the private folder, readable by this user only.
+fn write_private(name: &str, token: &str) -> Result<PathBuf, String> {
     let dir = private_dir()?;
-    let path = dir.join(format!("{port}.token"));
+    let path = dir.join(name);
     // `remove_file` removes a symlink itself, not what it points to; `create_new` then never
     // follows anything that is left.
     match std::fs::remove_file(&path) {
@@ -324,6 +447,14 @@ impl Relay {
             preauth: AtomicUsize::new(0),
             attached: AtomicUsize::new(0),
             reply_wait,
+            port,
+            allow_access: AtomicBool::new(false),
+            grants: Mutex::new(HashMap::new()),
+            reviewed: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(Vec::new()),
+            granted: Mutex::new(HashMap::new()),
+            grant_ids: AtomicU64::new(0),
+            run_id: random_token()?.chars().take(8).collect(),
         });
         let owner = Arc::new(Owner { shared, port });
         let accepting = Arc::clone(&owner.shared);
@@ -363,23 +494,125 @@ impl Relay {
         *lock(&self.owner.shared.wake) = Some(wake);
     }
 
+    /// Lets agents attached with the relay's own token use files and the network without asking
+    /// (`--yes`), or goes back to what each asked. The desktop app allows it while the user has
+    /// agents turned on. It applies to their next call.
+    pub fn set_allow_access(&self, allow: bool) {
+        self.owner.shared.allow_access.store(allow, SeqCst);
+    }
+
+    /// A run-scoped token for an agent the app starts itself: connections that attach with it may
+    /// use files and the network only if `access`. Dropping the [`Grant`] revokes it.
+    pub fn grant(&self, access: bool) -> Result<Grant, String> {
+        let shared = &self.owner.shared;
+        let token = random_token()?;
+        let n = shared.grant_ids.fetch_add(1, SeqCst);
+        let file = write_private(&format!("{}-{}-{n}.token", shared.port, shared.run_id), &token)?;
+        let mut grants = lock(&shared.grants);
+        // Checked under the lock `shutdown` drains: a grant made as the relay stops would outlive
+        // it with its file left behind.
+        if shared.stopped.load(SeqCst) {
+            drop(grants);
+            let _ = std::fs::remove_file(&file);
+            return Err("the MCP relay has stopped".into());
+        }
+        grants.insert(token.clone(), (access, file.clone()));
+        drop(grants);
+        Ok(Grant { token, file, shared: Arc::downgrade(shared) })
+    }
+
+    /// A local agent still has file/network capability, but every gated MCP message waits for
+    /// RustGIS-side approval. Neither --yes nor the global relay checkbox bypasses this queue.
+    pub fn grant_reviewed(&self, auto: bool) -> Result<Grant, String> {
+        let grant = self.grant(true)?;
+        let grants = lock(&self.owner.shared.grants);
+        if self.owner.shared.stopped.load(SeqCst) || !grants.contains_key(&grant.token) {
+            return Err("the MCP relay has stopped".into());
+        }
+        lock(&self.owner.shared.reviewed).insert(grant.token.clone(), auto);
+        drop(grants);
+        Ok(grant)
+    }
+
     /// Runs the messages that arrived since the last call, on `s`. Returns how many ran. The
     /// calls go through [`Session::run`], so each is one undo step as everywhere else. A message
     /// whose connection already gave up is skipped, never run.
     pub fn poll(&self, s: &mut Session) -> usize {
         let pending: Vec<Request> = lock(&self.owner.shared.requests).drain(..).collect();
+        // The skills switched on, read once for the batch and only when a message asks for them:
+        // this runs on the app's thread, and reading the skill folders is file I/O.
+        let mut skills: Option<Vec<crate::skills::Skill>> = None;
         let mut ran = 0;
-        for req in pending {
+        lock(&self.owner.shared.approvals).retain(|a| a.state.load(SeqCst) == PENDING);
+        for mut req in pending {
+            if req.state.load(SeqCst) != PENDING {
+                continue;
+            }
+            let Some(access) = self.owner.shared.access(&req.token, req.asked) else {
+                req.state.store(CANCELLED, SeqCst);
+                continue;
+            };
+            if req.decision.load(SeqCst) == CANCELLED {
+                if req.state.compare_exchange(PENDING, RUNNING, SeqCst, SeqCst).is_ok() {
+                    let _ = req.reply.send(Some(declined_reply(&req.line)));
+                    ran += 1;
+                }
+                continue;
+            }
+            // Serialize policy changes with claiming the request: turning auto approval off
+            // wins unless this request has already become in-flight.
+            let policy = lock(&self.owner.shared.reviewed);
+            let reviewed = policy.get(&req.token).copied() == Some(false);
+            if reviewed && access {
+                if !req.approval_required
+                    && let Some(summary) = approval_summary(s, &req.line)
+                {
+                    req.approval_required = true;
+                    req.held.store(true, SeqCst);
+                    lock(&self.owner.shared.approvals).push(Approval {
+                        id: req.id,
+                        summary,
+                        token: req.token.clone(),
+                        state: Arc::clone(&req.state),
+                        decision: Arc::clone(&req.decision),
+                    });
+                }
+                if req.approval_required {
+                    match req.decision.load(SeqCst) {
+                        PENDING => {
+                            lock(&self.owner.shared.requests).push_back(req);
+                            continue;
+                        }
+                        CANCELLED => {
+                            if req.state.compare_exchange(PENDING, RUNNING, SeqCst, SeqCst).is_ok() {
+                                let _ = req.reply.send(Some(declined_reply(&req.line)));
+                                ran += 1;
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             if req.state.compare_exchange(PENDING, RUNNING, SeqCst, SeqCst).is_err() {
                 continue;
             }
+            drop(policy);
             // Claimed first, then checked: a stop that came before the claim keeps the whole
             // batch from running (its connections are already closed).
             if self.owner.shared.stopped.load(SeqCst) {
                 req.state.store(CANCELLED, SeqCst);
                 continue;
             }
-            let server = Server::new(req.allow_access);
+            // Decided now, not when it was queued; a grant revoked meanwhile cancels it.
+            let Some(allow_access) = self.owner.shared.access(&req.token, req.asked) else {
+                req.state.store(CANCELLED, SeqCst);
+                continue;
+            };
+            let mut server = Server::new(allow_access);
+            if asks_for_skills(&req.line) {
+                server.skills = skills.get_or_insert_with(crate::skills::installed).clone();
+            }
             // A last resort: a panic answers that message with an error instead of breaking the
             // app (Session::run catches panics inside commands; this covers the tools around it).
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.handle(s, &req.line)))
@@ -388,6 +621,17 @@ impl Relay {
             ran += 1;
         }
         ran
+    }
+}
+
+/// Whether a message (or a message in a batch) is `prompts/list` or `prompts/get`, the only ones
+/// that read skills.
+fn asks_for_skills(line: &str) -> bool {
+    let prompts = |m: &Value| matches!(m.get("method").and_then(Value::as_str), Some("prompts/list" | "prompts/get"));
+    match serde_json::from_str::<Value>(line) {
+        Ok(Value::Array(batch)) => batch.iter().any(prompts),
+        Ok(m) => prompts(&m),
+        Err(_) => false,
     }
 }
 
@@ -419,6 +663,7 @@ impl Drop for Slot {
     /// client count if it had attached.
     fn drop(&mut self) {
         lock(&self.shared.streams).remove(&self.id);
+        lock(&self.shared.granted).remove(&self.id);
         if self.preauth {
             self.shared.preauth.fetch_sub(1, SeqCst);
         }
@@ -507,7 +752,10 @@ fn connection(stream: TcpStream, slot: &mut Slot) {
     let Ok(mut output) = stream.try_clone() else { return };
     let mut input =
         std::io::BufReader::new(Handshake { stream, deadline: Some(Instant::now() + PREAUTH_TIMEOUT), shared: Arc::clone(&shared) });
-    let mut allow_access = false;
+    // What the client asked for (`--yes`) and the token it attached with: what it may do is looked
+    // up for each call, so the app's setting and a revoked grant apply at once.
+    let mut asked = false;
+    let mut token = String::new();
     loop {
         let max = if slot.attached { MAX_LINE } else { MAX_PREAUTH_LINE };
         let line = match read_message_max(&mut input, max, Oversize::Stop) {
@@ -540,12 +788,23 @@ fn connection(stream: TcpStream, slot: &mut Slot) {
             // connection allows).
             let is_attach = msg.get("method").and_then(Value::as_str) == Some(ATTACH);
             if !slot.attached || is_attach {
-                let token_ok =
-                    msg.get("params").and_then(|p| p.get("token")).and_then(Value::as_str).is_some_and(|t| same_token(t, &shared.token));
-                if !is_attach || !token_ok {
+                let given = msg.get("params").and_then(|p| p.get("token")).and_then(Value::as_str).unwrap_or("");
+                if !is_attach || shared.access(given, false).is_none() {
                     return;
                 }
-                allow_access = msg.get("params").and_then(|p| p.get("access")).and_then(Value::as_bool).unwrap_or(false);
+                token = given.to_string();
+                if same_token(given, &shared.token) {
+                    // Re-attached with the relay's own token: no longer a grant's connection.
+                    lock(&shared.granted).remove(&slot.id);
+                } else {
+                    lock(&shared.granted).insert(slot.id, token.clone());
+                    // A grant revoked between the check above and this insert: the revocation
+                    // missed this connection, so it ends here.
+                    if shared.access(given, false).is_none() {
+                        return;
+                    }
+                }
+                asked = msg.get("params").and_then(|p| p.get("access")).and_then(Value::as_bool).unwrap_or(false);
                 if !slot.attached {
                     slot.attached = true;
                     slot.preauth = false;
@@ -560,19 +819,37 @@ fn connection(stream: TcpStream, slot: &mut Slot) {
         if shared.stopped.load(SeqCst) {
             return;
         }
+        // A revoked grant ends the connection.
+        if shared.access(&token, asked).is_none() {
+            return;
+        }
         let expects = expects_reply(&line);
         let id = msg.as_ref().map_or(Value::Null, request_id);
         let state = Arc::new(AtomicU8::new(PENDING));
+        let held = Arc::new(AtomicBool::new(false));
         let (tx, rx) = sync_channel(1);
         let queued = {
             let mut queue = lock(&shared.requests);
             if shared.stopped.load(SeqCst) {
                 return;
             }
-            if queue.len() >= MAX_QUEUE {
+            // Requests waiting for the user's approval don't take the room of others (reads still
+            // run while the user decides), within a cap of their own.
+            let waiting = queue.iter().filter(|r| r.approval_required).count();
+            if queue.len() - waiting >= MAX_QUEUE || waiting >= MAX_QUEUE {
                 false
             } else {
-                queue.push_back(Request { line, allow_access, reply: tx, state: Arc::clone(&state) });
+                queue.push_back(Request {
+                    approval_required: false,
+                    held: Arc::clone(&held),
+                    id: shared.next_id.fetch_add(1, SeqCst),
+                    decision: Arc::new(AtomicU8::new(PENDING)),
+                    line,
+                    token: token.clone(),
+                    asked,
+                    reply: tx,
+                    state: Arc::clone(&state),
+                });
                 true
             }
         };
@@ -588,12 +865,30 @@ fn connection(stream: TcpStream, slot: &mut Slot) {
         if !expects {
             continue;
         }
-        let reply = match wait_reply(&rx, &shared, shared.reply_wait) {
+        let asked_at = Instant::now();
+        let mut answer = wait_reply(&rx, &shared, shared.reply_wait);
+        // Waiting for the user's approval: the user takes their time, within a limit of its own.
+        while matches!(answer, Err(RecvTimeoutError::Timeout))
+            && held.load(SeqCst)
+            && state.load(SeqCst) == PENDING
+            && asked_at.elapsed() < APPROVAL_WAIT
+        {
+            answer = wait_reply(&rx, &shared, shared.reply_wait.min(APPROVAL_WAIT.saturating_sub(asked_at.elapsed())));
+        }
+        let reply = match answer {
             Ok(reply) => reply,
             Err(RecvTimeoutError::Timeout) => {
                 // Not yet running: cancel it, so the app can never run it after the client has
                 // been told it failed.
                 if state.compare_exchange(PENDING, CANCELLED, SeqCst, SeqCst).is_ok() {
+                    // Not approved in time: this request fails, the connection stays (the bridge
+                    // doesn't reconnect).
+                    if held.load(SeqCst) {
+                        if !send_line(&mut output, &error_reply(&id, -32002, "the request was not approved in time; it was cancelled")) {
+                            return;
+                        }
+                        continue;
+                    }
                     send_line(&mut output, &error_reply(&id, -32002, "the app did not run the command in time; it was cancelled"));
                     return;
                 }
@@ -653,6 +948,64 @@ fn request_id(msg: &Value) -> Value {
     msg.get("id").filter(|id| id.is_string() || id.is_number()).cloned().unwrap_or(Value::Null)
 }
 
+/// Preflight the exact tool calls in a message, including batches. Reserved commands still go
+/// through Server::refusal and remain unavailable even after approval.
+fn approval_summary(s: &Session, line: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(line).ok()?;
+    let messages = msg.as_array().map(Vec::as_slice).unwrap_or_else(|| std::slice::from_ref(&msg));
+    let server = Server { allow_access: true, skills: Vec::new() };
+    let mut summaries = Vec::new();
+    for msg in messages {
+        if msg.get("method").and_then(Value::as_str) != Some("tools/call") || msg.get("id").is_none() {
+            continue;
+        }
+        let Some(params) = msg.get("params") else { continue };
+        let Some(name) = params.get("name").and_then(Value::as_str) else { continue };
+        let call = crate::provider::ToolCall {
+            id: String::new(),
+            name: name.to_string(),
+            args: params.get("arguments").cloned().unwrap_or(Value::Null),
+        };
+        if server.refusal(s, &call).is_none()
+            && let Some(reason) = crate::tools::gate(s, &call)
+        {
+            summaries.push(format!("{}: {reason}", approval_text(name, &call.args)));
+        }
+    }
+    (!summaries.is_empty()).then(|| summaries.join("\n"))
+}
+
+/// The most of a request's arguments an approval shows.
+const MAX_APPROVAL_TEXT: usize = 4096;
+
+/// A tool call as an approval shows it: its complete arguments, never cut (a cut text could hide
+/// the file or address approved), or a request too long to show, to decline.
+fn approval_text(name: &str, args: &Value) -> String {
+    let full = args.to_string();
+    if full.len() > MAX_APPROVAL_TEXT {
+        format!("{name}: a request too long to show in full ({} bytes); decline it", full.len())
+    } else {
+        format!("{name} {full}")
+    }
+}
+
+fn declined_reply(line: &str) -> String {
+    let msg: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+    let denied = |msg: &Value| {
+        let id = msg.get("id")?;
+        let message = "The user declined this MCP request. Do not retry it.";
+        if msg.get("method").and_then(Value::as_str) == Some("tools/call") {
+            Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"isError":true,"content":[{"type":"text","text":message}]}}))
+        } else {
+            Some(serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}}))
+        }
+    };
+    match msg.as_array() {
+        Some(batch) => Value::Array(batch.iter().filter_map(denied).collect()).to_string(),
+        None => denied(&msg).unwrap_or(Value::Null).to_string(),
+    }
+}
+
 /// A JSON-RPC error reply to `id`.
 fn error_reply(id: &Value, code: i64, message: &str) -> String {
     serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
@@ -667,6 +1020,19 @@ fn internal_error(message: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
+    /// Only prompt requests read the skill folders (on the app's thread); a batch with one does.
+    #[test]
+    fn only_prompt_requests_load_skills() {
+        assert!(super::asks_for_skills(r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list"}"#));
+        assert!(super::asks_for_skills(r#"{"jsonrpc":"2.0","id":1,"method":"prompts\/get","params":{"name":"x"}}"#));
+        assert!(super::asks_for_skills(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":2,"method":"prompts/list"}]"#));
+        for line in
+            [r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#, "not json", "[1, 2]", "{}"]
+        {
+            assert!(!super::asks_for_skills(line), "{line}");
+        }
+    }
+
     use std::io::{BufRead, BufReader, Write};
     use std::sync::atomic::AtomicUsize;
 
@@ -674,6 +1040,86 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn reviewed_grants_require_exact_run_scoped_approvals() {
+        let relay = Relay::start(0).unwrap();
+        relay.set_allow_access(true); // The global checkbox must not bypass run-specific review.
+        let grant = relay.grant_reviewed(false).unwrap();
+        let other = relay.grant_reviewed(false).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut s = sample();
+        let export = |path: &std::path::Path| json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run_command","arguments":{"command":"share.exportMap","params":{"path":path,"width":64,"height":64}}}});
+        let queue = |message: Value| {
+            let (tx, rx) = sync_channel(1);
+            let state = Arc::new(AtomicU8::new(PENDING));
+            let id = relay.owner.shared.next_id.fetch_add(1, SeqCst);
+            lock(&relay.owner.shared.requests).push_back(Request {
+                approval_required: false,
+                held: Arc::default(),
+                id,
+                decision: Arc::new(AtomicU8::new(PENDING)),
+                line: message.to_string(),
+                token: grant.token.clone(),
+                asked: true,
+                reply: tx,
+                state: Arc::clone(&state),
+            });
+            (id, rx, state)
+        };
+        let path = root.path().join("allowed.png");
+        let (id, rx, _) = queue(export(&path));
+        assert_eq!(relay.poll(&mut s), 0);
+        assert!(!path.exists());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(grant.pending().len(), 1);
+        assert!(grant.pending()[0].summary.contains("share.exportMap"));
+        other.decide(id, true);
+        assert_eq!(relay.poll(&mut s), 0, "another run cannot approve this request");
+        grant.decide(id, true);
+        assert_eq!(relay.poll(&mut s), 1);
+        assert!(path.exists());
+        let reply: Value = serde_json::from_str(&rx.recv().unwrap().unwrap()).unwrap();
+        assert_ne!(reply["result"]["isError"], true, "{reply}");
+        let denied = root.path().join("denied.png");
+        let (id, rx, _) = queue(export(&denied));
+        assert_eq!(relay.poll(&mut s), 0);
+        grant.decide(id, false);
+        grant.set_auto(true); // An explicit decline wins even if auto approval is then enabled.
+        assert_eq!(relay.poll(&mut s), 1);
+        assert!(rx.recv().unwrap().unwrap().contains("declined"));
+        assert!(!denied.exists());
+        grant.set_auto(false);
+        let batch_path = root.path().join("batch.png");
+        let (id, rx, _) = queue(json!([{"jsonrpc":"2.0","id":0,"method":"tools/call"},export(&batch_path)]));
+        assert_eq!(relay.poll(&mut s), 0, "malformed earlier entries cannot bypass batch approval");
+        grant.decide(id, false);
+        assert_eq!(relay.poll(&mut s), 1);
+        assert!(rx.recv().unwrap().unwrap().contains("declined"));
+        assert!(!batch_path.exists());
+        let expired = root.path().join("expired.png");
+        let (id, _, state) = queue(export(&expired));
+        assert_eq!(relay.poll(&mut s), 0);
+        state.store(CANCELLED, SeqCst);
+        grant.decide(id, true);
+        assert_eq!(relay.poll(&mut s), 0, "an expired request cannot be revived");
+        assert!(!expired.exists());
+        grant.set_auto(true);
+        let auto = root.path().join("auto.png");
+        let (_, rx, _) = queue(export(&auto));
+        assert_eq!(relay.poll(&mut s), 1);
+        assert!(auto.exists());
+        assert!(rx.recv().unwrap().is_some());
+        grant.set_auto(false);
+        let revoked = root.path().join("revoked.png");
+        let (_, _, state) = queue(export(&revoked));
+        assert_eq!(relay.poll(&mut s), 0);
+        drop(grant);
+        assert_eq!(relay.poll(&mut s), 0);
+        assert_eq!(state.load(SeqCst), CANCELLED);
+        assert!(!revoked.exists());
+        relay.stop();
+    }
 
     fn sample() -> Session {
         let mut s = Session::new(Project::default());
@@ -839,6 +1285,183 @@ mod tests {
         relay.stop();
     }
 
+    /// Attaches with any token, asking for file and network access or not.
+    fn attach_with(client: &mut TcpStream, token: &str, access: bool) {
+        let hello = json!({"jsonrpc": "2.0", "method": "rustgis/attach", "params": {"access": access, "token": token}});
+        writeln!(client, "{hello}").unwrap();
+        client.flush().unwrap();
+    }
+
+    /// Asks the relay to export the map to `out`; the reply.
+    fn export(client: &mut TcpStream, relay: &Relay, s: &mut Session, out: &std::path::Path, id: u64) -> Value {
+        let call = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "run_command",
+            "arguments": {"command": "share.exportMap", "params": {"path": out.display().to_string()}}
+        }});
+        writeln!(client, "{call}").unwrap();
+        client.flush().unwrap();
+        settle(relay, s);
+        reply(client)
+    }
+
+    /// With agents turned on in the app, an attached agent may use files and the network without
+    /// asking (`--yes`); turned off, what it asked for decides, as before.
+    #[test]
+    fn relay_app_lets_agents_use_files_without_yes() {
+        let relay = Relay::start(0).unwrap();
+        let mut s = sample();
+        let out = std::env::temp_dir().join(format!("rustgis-relay-app-access-{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port())).unwrap();
+        attach(&mut client, &relay, false);
+        // Not asked, not allowed by the app: refused, pointing at --yes (as before).
+        let r = export(&mut client, &relay, &mut s, &out, 1);
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        assert!(!out.exists());
+        // The app allows it: the same connection's next call runs, without --yes.
+        relay.set_allow_access(true);
+        let r = export(&mut client, &relay, &mut s, &out, 2);
+        assert_ne!(r["result"]["isError"], true, "{r}");
+        assert!(out.exists(), "the export didn't run once the app allowed it");
+        let _ = std::fs::remove_file(&out);
+        // Turned off again, it's refused again; a client that asked still may.
+        relay.set_allow_access(false);
+        assert_eq!(export(&mut client, &relay, &mut s, &out, 3)["result"]["isError"], true);
+        let mut asked = TcpStream::connect(("127.0.0.1", relay.port())).unwrap();
+        attach(&mut asked, &relay, true);
+        assert_ne!(export(&mut asked, &relay, &mut s, &out, 4)["result"]["isError"], true);
+        let _ = std::fs::remove_file(&out);
+        relay.stop();
+    }
+
+    /// A grant is a run-scoped token with its own access; dropping it revokes the token, removes
+    /// its file and closes its connections.
+    #[test]
+    fn relay_grants_are_scoped_and_revocable() {
+        let relay = Relay::start(0).unwrap();
+        let mut s = sample();
+        let out = std::env::temp_dir().join(format!("rustgis-relay-grant-{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let full = relay.grant(true).unwrap();
+        let map_only = relay.grant(false).unwrap();
+        let token = read_token_file(full.token_file()).unwrap();
+        assert_ne!(token, read_token(relay.port()).unwrap(), "a grant has a token of its own");
+        // The full grant may export, though the client didn't ask and the app's setting is off.
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port())).unwrap();
+        attach_with(&mut client, &token, false);
+        assert_ne!(export(&mut client, &relay, &mut s, &out, 1)["result"]["isError"], true);
+        assert!(out.exists());
+        let _ = std::fs::remove_file(&out);
+        // The map-only grant may not, even when the client asks.
+        let mut limited = TcpStream::connect(("127.0.0.1", relay.port())).unwrap();
+        attach_with(&mut limited, &read_token_file(map_only.token_file()).unwrap(), true);
+        assert_eq!(export(&mut limited, &relay, &mut s, &out, 2)["result"]["isError"], true);
+        assert!(!out.exists());
+        // Revoked: the file goes, the connection closes, and the token no longer attaches.
+        let file = full.token_file().to_path_buf();
+        drop(full);
+        assert!(!file.exists());
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut line = String::new();
+        assert_eq!(
+            BufReader::new(client.try_clone().unwrap()).read_line(&mut line).unwrap_or(0),
+            0,
+            "a revoked grant's connection stayed open"
+        );
+        let mut again = TcpStream::connect(("127.0.0.1", relay.port())).unwrap();
+        attach_with(&mut again, &token, true);
+        again.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut line = String::new();
+        assert_eq!(BufReader::new(again.try_clone().unwrap()).read_line(&mut line).unwrap_or(0), 0, "a revoked token attached");
+        // Stopping the relay removes the other grant's file, and refuses new grants.
+        let other = map_only.token_file().to_path_buf();
+        relay.stop();
+        assert!(!other.exists());
+        assert!(relay.grant(true).is_err(), "a grant after the relay stopped");
+        // Grant files carry the run's id: another run on the same port names its own.
+        wait_until("the port to close", || TcpStream::connect(("127.0.0.1", relay.port())).is_err());
+        let next = Relay::start(relay.port()).unwrap();
+        let fresh = next.grant(true).unwrap();
+        assert_ne!(fresh.token_file(), other.as_path());
+        next.stop();
+    }
+
+    /// Permission is decided when the app runs a request: one queued before its grant was revoked
+    /// never runs. A connection that re-attached with the relay's own token isn't the grant's.
+    #[test]
+    fn relay_revocation_reaches_queued_requests_and_spares_reattached_connections() {
+        let relay = Relay::start(0).unwrap();
+        let mut s = sample();
+        let out = std::env::temp_dir().join(format!("rustgis-relay-queued-{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let grant = relay.grant(true).unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port())).unwrap();
+        attach_with(&mut client, &read_token_file(grant.token_file()).unwrap(), false);
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "run_command",
+            "arguments": {"command": "share.exportMap", "params": {"path": out.display().to_string()}}
+        }});
+        writeln!(client, "{call}").unwrap();
+        client.flush().unwrap();
+        // Queued, not yet run: the grant goes, then the app's frame comes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while lock(&relay.owner.shared.requests).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the request was never queued");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(grant);
+        assert_eq!(relay.poll(&mut s), 0, "a request queued before its grant was revoked ran");
+        assert!(!out.exists());
+        // Attached with a grant, then re-attached with the relay's own token: revoking the grant
+        // leaves it open.
+        let other = relay.grant(true).unwrap();
+        let mut moved = TcpStream::connect(("127.0.0.1", relay.port())).unwrap();
+        attach_with(&mut moved, &read_token_file(other.token_file()).unwrap(), false);
+        attach(&mut moved, &relay, true);
+        // A round trip: the re-attach line has been handled once this is answered.
+        writeln!(moved, "{}", json!({"jsonrpc": "2.0", "id": 9, "method": "tools/list"})).unwrap();
+        moved.flush().unwrap();
+        settle(&relay, &mut s);
+        assert!(reply(&moved)["result"]["tools"].is_array());
+        drop(other);
+        let r = export(&mut moved, &relay, &mut s, &out, 2);
+        assert_ne!(r["result"]["isError"], true, "a connection on the relay's own token was closed with the grant: {r}");
+        let _ = std::fs::remove_file(&out);
+        relay.stop();
+    }
+
+    /// A request waiting for the user's approval outlasts the app's reply wait: its card stays,
+    /// and once allowed it runs and answers on the same connection.
+    #[test]
+    fn approval_held_requests_wait_for_the_user() {
+        let relay = Relay::bind_with(SocketAddr::from(([127, 0, 0, 1], 0)), Duration::from_millis(100)).unwrap();
+        let grant = relay.grant_reviewed(false).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("held.png");
+        let mut s = sample();
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port())).unwrap();
+        attach_with(&mut client, &read_token_file(grant.token_file()).unwrap(), true);
+        let call = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_command","arguments":{"command":"share.exportMap","params":{"path":out,"width":64,"height":64}}}});
+        writeln!(client, "{call}").unwrap();
+        client.flush().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while grant.pending().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the request never asked for approval");
+            relay.poll(&mut s);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        relay.poll(&mut s);
+        let pending = grant.pending();
+        assert_eq!(pending.len(), 1, "the approval expired with the app's reply wait");
+        grant.decide(pending[0].id, true);
+        settle(&relay, &mut s);
+        let r = reply(&client);
+        assert_eq!(r["id"], 4, "{r}");
+        assert!(r.get("error").is_none() && out.exists(), "{r}");
+        relay.stop();
+    }
+
     /// A command whose reply times out is cancelled: the client gets an error, and the app's
     /// next frame does not run it.
     #[test]
@@ -928,6 +1551,42 @@ mod tests {
         assert_eq!(relay.poll(&mut s), 0);
         assert_eq!(relay.attached_clients(), 0);
         relay.stop();
+    }
+
+    /// Bare relative grant paths work in a private directory and retain all permission checks.
+    #[cfg(unix)]
+    #[test]
+    fn relative_token_file_uses_its_current_directory() {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        if std::env::var_os("RUSTGIS_TEST_RELATIVE_TOKEN").is_some() {
+            let file = std::path::Path::new("grant.token");
+            assert_eq!(read_token_file(file).unwrap(), "synthetic-token");
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(read_token_file(file).unwrap_err().contains("readable by others"));
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(".", std::fs::Permissions::from_mode(0o750)).unwrap();
+            assert!(read_token_file(file).unwrap_err().contains("readable by others"));
+            std::fs::set_permissions(".", std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::os::unix::fs::symlink("grant.token", "link.token").unwrap();
+            assert!(read_token_file(std::path::Path::new("link.token")).is_err());
+            let missing = read_token_file(std::path::Path::new("missing.token")).unwrap_err();
+            assert!(missing.contains("--token-file") && missing.contains("relay or grant"));
+            return;
+        }
+        // A child process isolates the current directory from tests running in parallel.
+        let dir = std::env::temp_dir().join(format!("rustgis-relative-token-{}", random_token().unwrap()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dir.join("grant.token")).unwrap();
+        file.write_all(b"synthetic-token").unwrap();
+        drop(file);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "relay::tests::relative_token_file_uses_its_current_directory", "--nocapture"])
+            .env("RUSTGIS_TEST_RELATIVE_TOKEN", "1")
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(status.success());
     }
 
     /// The token is 32 hex characters from the operating system, differs per run, and is
@@ -1043,5 +1702,20 @@ mod tests {
         let _ = client.shutdown(Shutdown::Both);
         let _ = trickle.join();
         relay.stop();
+    }
+
+    /// An approval shows the whole request: padding that sorts first can't push the path out of
+    /// view, and a request too long to show says so.
+    #[test]
+    fn approvals_show_the_whole_request() {
+        let s = Session::new(Project::default());
+        let call = |params: Value| {
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "run_command", "arguments": {"command": "share.exportMap", "params": params}}})
+                .to_string()
+        };
+        let padded = approval_summary(&s, &call(json!({"a": "a".repeat(400), "path": "/home/u/.profile"}))).unwrap();
+        assert!(padded.contains("/home/u/.profile"), "{padded}");
+        let huge = approval_summary(&s, &call(json!({"a": "a".repeat(5000), "path": "/home/u/.profile"}))).unwrap();
+        assert!(huge.contains("too long to show in full") && !huge.contains(".profile"), "{huge}");
     }
 }

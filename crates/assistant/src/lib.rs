@@ -13,8 +13,10 @@
 //! - [`docs`]: the documentation, built in, for MCP clients to search and read.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod acp;
 pub mod agent;
 pub mod chatgpt;
+pub mod compact;
 pub mod docs;
 pub mod error;
 pub use error::{Error, Recovery};
@@ -25,9 +27,10 @@ pub mod mcp;
 pub mod provider;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod relay;
+pub mod skills;
 #[cfg(test)]
 mod tests;
 pub mod tools;
 
 pub use agent::{Agent, Entry, Step};
-pub use provider::{Api, Config, HttpRequest, HttpResponse, PRESETS, Preset};
+pub use provider::{Api, Config, HttpRequest, HttpResponse, Note, PRESETS, Preset};

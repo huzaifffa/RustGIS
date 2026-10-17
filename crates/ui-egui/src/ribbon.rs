@@ -356,14 +356,13 @@ fn home_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 }
             }
             ui.separator();
-            if ui.button(tl!("New Bookmark…")).clicked() {
-                let _ = app.run("ui.dialog", json!({"name": "bookmark"}));
-                ui.close();
-            }
+            menu_item(ui, app, "bookmark_new", "New Bookmark…", "ui.dialog", json!({"name": "bookmark"}));
             // Every map's bookmarks, renamed, described, updated and ordered in place (#351).
             menu_item(ui, app, "pane_right", "Manage Bookmarks", "ui.pane.bookmarks", Value::Null);
-            menu_item(ui, app, "open", "Import Bookmarks…", "ui.openItem", json!({"kind": "bookmarks"}));
-            menu_item(ui, app, "save", "Export Bookmarks…", "ui.saveItem", json!({"kind": "bookmarks"}));
+            // The files apart from the bookmarks themselves.
+            ui.separator();
+            menu_item(ui, app, "bookmark_import", "Import Bookmarks…", "ui.openItem", json!({"kind": "bookmarks"}));
+            menu_item(ui, app, "bookmark_export", "Export Bookmarks…", "ui.saveItem", json!({"kind": "bookmarks"}));
         });
         col(ui, |ui| {
             small(ui, app, "zoom_full", "Full Extent", "Zoom to the extent of all layers.", "map.zoomFull", Value::Null, false);
@@ -1999,7 +1998,7 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 menu_item(ui, app, "settings", "Topology Options…", "ui.pane.editing", Value::Null);
                 if ui.button(tl!("Error Inspector (validate)")).clicked() {
                     let _ = app.run("topology.validate", Value::Null);
-                    app.ui.right = Some(RightPane::Editing);
+                    app.ui.open_right(RightPane::Editing);
                     ui.close();
                 }
             });
@@ -2450,6 +2449,30 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 }
             }
         });
+        col(ui, |ui| {
+            let snap = !app.layout.no_snap;
+            let desc = "Snap elements to guides, the page and each other as you move or resize them. Hold Alt to place one freely.";
+            if small(ui, app, "keep_tool", "Snap", desc, "ui.menu", Value::Null, snap).clicked() {
+                app.layout.no_snap = snap;
+            }
+            let shown = !app.layout.no_rulers;
+            let desc = "Show rulers. Drag from a ruler to add a guide; drag a guide back onto it to remove it.";
+            if small(ui, app, "measure", "Rulers", desc, "ui.menu", Value::Null, shown).clicked() {
+                app.layout.no_rulers = shown;
+            }
+            if !layout.guides.is_empty() {
+                small(
+                    ui,
+                    app,
+                    "delete",
+                    "Clear Guides",
+                    "Remove every guide from this layout.",
+                    "layout.guides",
+                    json!({"layout": li, "clear": true}),
+                    false,
+                );
+            }
+        });
     });
     group(ui, "Map Frames", |ui| {
         big_menu(ui, app, "map", "Map\nFrame", "Add a map frame showing a map of the project.", |ui, app| {
@@ -2771,16 +2794,61 @@ fn settings_tab(app: &mut RustGisApp, ui: &mut Ui) {
     group(ui, "Start-up", |ui| start_project_menu(app, ui));
 }
 
-/// Settings › Start-up › Start With: the World Atlas sample or an empty project.
+/// Settings › Start-up › Start With: the World Atlas sample, an empty project, or (in the
+/// desktop app) a project picked once or the last one opened or saved (#377).
 fn start_project_menu(app: &mut RustGisApp, ui: &mut Ui) {
-    let blank = app.ui.start_blank;
-    let current = if blank { tl!("Blank Map") } else { tl!("World Atlas") };
+    use crate::StartWith;
+    let with = app.ui.start_with.clone();
+    // The button's second line is the file's name, kept short so the ribbon keeps its width.
+    let short_name = |p: &str| {
+        let name = std::path::Path::new(p).file_name().map_or_else(|| p.to_string(), |n| n.to_string_lossy().into_owned());
+        if name.chars().count() > 24 { format!("{}…", name.chars().take(23).collect::<String>()) } else { name }
+    };
+    let current = match &with {
+        StartWith::Sample => tl!("World Atlas").to_string(),
+        StartWith::Blank => tl!("Blank Map").to_string(),
+        StartWith::Last => tl!("Last Project").to_string(),
+        StartWith::File(p) => short_name(p),
+    };
     let label = format!("{}\n{current}", tl!("Start With"));
-    big_menu(ui, app, "map", &label, "What RustGIS opens with: the World Atlas sample or a blank map.", move |ui, app| {
-        for (b, name) in [(false, tl!("World Atlas")), (true, tl!("Blank Map"))] {
-            if ui.add(egui::Button::selectable(blank == b, name)).clicked() {
-                let _ = app.run("ui.startup", json!({"blank": b}));
+    let files = app.opens_files();
+    let tip = if files {
+        "What RustGIS opens with: the World Atlas sample, a blank map, a project you choose, or the last project opened or saved."
+    } else {
+        "What RustGIS opens with: the World Atlas sample or a blank map."
+    };
+    big_menu(ui, app, "map", &label, tip, move |ui, app| {
+        for (w, name) in [(StartWith::Sample, tl!("World Atlas")), (StartWith::Blank, tl!("Blank Map"))] {
+            if ui.add(egui::Button::selectable(with == w, name)).clicked() {
+                let _ = app.run("ui.startup", json!({"project": w.json()}));
                 ui.close();
+            }
+        }
+        if !files {
+            return;
+        }
+        // Last Project: offered once there is one (or while it's the choice).
+        let last = app.ui.last_project.clone();
+        let item = ui
+            .add_enabled(last.is_some() || with == StartWith::Last, egui::Button::selectable(with == StartWith::Last, tl!("Last Project")))
+            .on_hover_text(last.clone().unwrap_or_else(|| tl!("No project opened or saved yet").to_string()))
+            .on_disabled_hover_text(tl!("No project opened or saved yet"));
+        if item.clicked() {
+            let _ = app.run("ui.startup", json!({"project": "last"}));
+            ui.close();
+        }
+        let chosen = match &with {
+            StartWith::File(p) => p.clone(),
+            _ => String::new(),
+        };
+        let item = ui.add(egui::Button::selectable(matches!(with, StartWith::File(_)), tl!("Choose Project…")));
+        let item = if chosen.is_empty() { item } else { item.on_hover_text(chosen) };
+        if item.clicked() {
+            ui.close();
+            if let Some(path) = crate::dialogs::pick_open(&["rgis", "rgisx"], tl!("RustGIS project"))
+                && let Err(e) = app.run("ui.startup", json!({"project": {"path": path}}))
+            {
+                app.session.notify(e, true);
             }
         }
     });
@@ -3362,8 +3430,8 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
         col(ui, |ui| {
             let mut c = crate::theme::c32(layer.renderer.base_symbol().fill);
             ui.horizontal(|ui| {
-                if ui.color_edit_button_srgba(&mut c).changed() {
-                    let _ = app.run("layer.color", json!({"color": crate::theme::rgba(c).hex()}));
+                if crate::widgets::color_button(ui, &mut c).changed() {
+                    let _ = app.run("layer.color", json!({"color": crate::theme::rgba(c).hex8()}));
                 }
                 ui.label(egui::RichText::new(tl!("Color")).size(11.5));
             });
@@ -3488,7 +3556,7 @@ fn raster_style_groups(app: &mut RustGisApp, ui: &mut Ui) {
             }
             ui.separator();
             if ui.button(tl!("Symbology Pane…")).clicked() {
-                app.ui.right = Some(RightPane::Symbology);
+                app.ui.open_right(RightPane::Symbology);
                 ui.close();
             }
         });
@@ -3739,7 +3807,7 @@ fn label_groups(app: &mut RustGisApp, ui: &mut Ui) {
             let mut c = crate::theme::c32(layer.labels.color);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tl!("Color")).size(11.5));
-                if ui.color_edit_button_srgba(&mut c).changed() {
+                if crate::widgets::color_button(ui, &mut c).changed() {
                     let _ = app.run("labels.style", json!({"color": crate::theme::rgba(c).hex()}));
                 }
             });

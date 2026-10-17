@@ -9,6 +9,8 @@ use crate::theme::{Tokens, regular, semibold};
 use crate::{RustGisApp, Slot, icons};
 
 type Reply = Slot<Result<HttpResponse, rustgis_assistant::Error>>;
+/// A streamed reply's pieces, as they arrive.
+type Chunks = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
 
 /// Example requests offered in an empty conversation.
 const SUGGESTIONS: &[&str] = &[
@@ -21,12 +23,14 @@ const SUGGESTIONS: &[&str] = &[
 
 #[derive(Default)]
 pub struct AssistantState {
-    agent: Option<Agent>,
+    pub(crate) agent: Option<Agent>,
     pub input: String,
     /// A message to send on the next frame (`ui.pane.assistant {"ask": …}`).
     pub queued: Option<String>,
     /// The request out: its generation and where its response lands.
     inflight: Option<(u64, Reply)>,
+    /// The pieces of the request out's reply, as they stream in (desktop).
+    chunks: Option<(u64, Chunks)>,
     /// The settings form is open.
     pub settings: bool,
     show_key: bool,
@@ -57,6 +61,16 @@ pub struct AssistantState {
     signout: Option<Slot<Result<(), rustgis_assistant::Error>>>,
     /// The first sign-in's confirmation that the ChatGPT plan is in use, until dismissed.
     welcome: bool,
+    /// A failed request to send again: its generation and when.
+    retry: Option<(u64, web_time::Instant)>,
+    /// The user lets the assistant hand tasks to local agents (Claude Code, Codex).
+    local_agents: bool,
+    /// Agent threads on this computer: their processes, windows and requests (desktop).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) threads: crate::agentthreads::Threads,
+    /// The user lets agents' requests through without asking (off unless chosen).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) agents_auto: bool,
     /// The saved ChatGPT registrations, read once (the file is locked across processes) and
     /// again after a sign-in, sign-out or selection.
     #[cfg(not(target_arch = "wasm32"))]
@@ -64,6 +78,19 @@ pub struct AssistantState {
     /// The last sign-in added a second registration for an account already saved.
     #[cfg(not(target_arch = "wasm32"))]
     duplicate: bool,
+    /// The plugins' revision when the agent's skills were read: plugins carry skills, so they're
+    /// read again when plugins change.
+    skills_rev: u64,
+    /// The settings' Skills list, read when shown (desktop).
+    #[cfg(not(target_arch = "wasm32"))]
+    skills_list: Option<(Vec<rustgis_assistant::skills::Listed>, Vec<String>)>,
+    /// What the last change to the skills did: whether it worked, and what to say.
+    #[cfg(not(target_arch = "wasm32"))]
+    skills_message: Option<(bool, String)>,
+    /// The agents on this computer, looked for when the settings open (a search of `PATH`, not
+    /// every frame) and again when the switch changes.
+    #[cfg(not(target_arch = "wasm32"))]
+    agents_found: Option<rustgis_assistant::acp::Installed>,
 }
 
 /// The settings fields typed into (saved when none has focus).
@@ -122,7 +149,38 @@ fn ensure_loaded(app: &mut RustGisApp) {
         app.assistant.account = signed_in_account();
     }
     app.assistant.catalog_pending = cfg.login() && !cfg.key.is_empty();
-    app.assistant.agent = Some(Agent::new(cfg, &app.session));
+    let mut agent = Agent::new(cfg, &app.session);
+    app.assistant.local_agents = pref(app, "assistant_local_agents").as_deref() == Some("on");
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        app.assistant.agents_auto = pref(app, "assistant_agents_auto").as_deref() == Some("on");
+    }
+    // The skills switched on (the plugins' too), and the local agents the user allows (desktop).
+    agent.set_skills(rustgis_assistant::skills::installed());
+    #[cfg(not(target_arch = "wasm32"))]
+    agent.set_agents_auto(app.assistant.agents_auto);
+    app.assistant.skills_rev = rustgis_engine::plugins::revision();
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.assistant.local_agents {
+        agent.set_harnesses(rustgis_assistant::acp::installed().0.into_iter().map(|(spec, _)| spec).collect());
+    }
+    app.assistant.agent = Some(agent);
+}
+
+/// Reads the skills again when they changed (`force`) or the plugins did.
+fn sync_skills(app: &mut RustGisApp, force: bool) {
+    let rev = rustgis_engine::plugins::revision();
+    if !force && rev == app.assistant.skills_rev {
+        return;
+    }
+    app.assistant.skills_rev = rev;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        app.assistant.skills_list = None;
+    }
+    if let Some(a) = app.assistant.agent.as_mut() {
+        a.set_skills(rustgis_assistant::skills::installed());
+    }
 }
 
 /// The ChatGPT account signed in on this computer, as its verified id token named it.
@@ -148,7 +206,7 @@ fn save_config(app: &RustGisApp, c: &Config) {
 }
 
 /// Sends a request off the frame. A signed-in account's requests renew its tokens as needed.
-fn dispatch(app: &mut RustGisApp, req: HttpRequest, login: Option<chatgpt::Binding>, ctx: &egui::Context) -> Reply {
+fn dispatch(app: &mut RustGisApp, req: HttpRequest, login: Option<chatgpt::Binding>, chunks: Option<Chunks>, ctx: &egui::Context) -> Reply {
     let slot: Reply = Slot::default();
     let fail = |slot: &Reply, e: String| {
         if let Ok(mut s) = slot.lock() {
@@ -176,9 +234,18 @@ fn dispatch(app: &mut RustGisApp, req: HttpRequest, login: Option<chatgpt::Bindi
     {
         let (out, ctx) = (slot.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let r = match &login {
-                Some(account) => chatgpt::send(&req, account),
-                None => rustgis_assistant::http::send(&req).map_err(Into::into),
+            let repaint = ctx.clone();
+            let mut on_chunk = |piece: &[u8]| {
+                if let Some(Ok(mut buf)) = chunks.as_ref().map(|c| c.lock()) {
+                    buf.extend_from_slice(piece);
+                }
+                repaint.request_repaint();
+            };
+            let r = match (&login, chunks.is_some()) {
+                (Some(account), true) => chatgpt::send_streaming(&req, account, &mut on_chunk),
+                (Some(account), false) => chatgpt::send(&req, account),
+                (None, true) => rustgis_assistant::http::send_streaming(&req, &mut on_chunk),
+                (None, false) => rustgis_assistant::http::send(&req),
             };
             if let Ok(mut s) = out.lock() {
                 *s = Some(r);
@@ -188,7 +255,7 @@ fn dispatch(app: &mut RustGisApp, req: HttpRequest, login: Option<chatgpt::Bindi
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (req, ctx, login);
+        let _ = (req, ctx, login, chunks);
         fail(&slot, "this build can't reach AI providers".into());
     }
     slot
@@ -198,7 +265,7 @@ fn dispatch(app: &mut RustGisApp, req: HttpRequest, login: Option<chatgpt::Bindi
 fn list_models(app: &mut RustGisApp, cfg: &Config, ctx: &egui::Context) {
     app.assistant.catalog_pending = false;
     let req = provider::models_request(cfg);
-    app.assistant.models_slot = Some(dispatch(app, req, cfg.login().then(|| cfg.binding()), ctx));
+    app.assistant.models_slot = Some(dispatch(app, req, cfg.login().then(|| cfg.binding()), None, ctx));
 }
 
 fn apply_config(app: &mut RustGisApp, cfg: Config) {
@@ -208,6 +275,8 @@ fn apply_config(app: &mut RustGisApp, cfg: Config) {
         {
             agent.stop();
             app.assistant.inflight = None;
+            app.assistant.retry = None;
+            app.assistant.chunks = None;
         }
         agent.config = cfg;
     }
@@ -266,14 +335,31 @@ fn take(slot: &Reply) -> Option<Result<HttpResponse, rustgis_assistant::Error>> 
     slot.lock().ok().and_then(|mut s| s.take())
 }
 
+/// Ends the agent threads on this computer (with every process they started), and the relay if
+/// they started it: nothing keeps acting on the map after the conversation.
+fn end_threads(app: &mut RustGisApp) {
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::agentthreads::end_all(app);
+    #[cfg(target_arch = "wasm32")]
+    let _ = app;
+}
+
 /// Carries out what the agent asked for.
-fn follow(app: &mut RustGisApp, step: Step, ctx: &egui::Context) {
+pub(crate) fn follow(app: &mut RustGisApp, step: Step, ctx: &egui::Context) {
     app.map.invalidate();
+    if let Step::Retry(after) = step {
+        let generation = app.assistant.agent.as_ref().map_or(0, Agent::generation);
+        app.assistant.retry = Some((generation, web_time::Instant::now() + after));
+        ctx.request_repaint_after(after);
+        return;
+    }
     if let Step::Send(req) = step {
         let generation = app.assistant.agent.as_ref().map_or(0, Agent::generation);
         let login = app.assistant.agent.as_ref().filter(|a| a.config.login()).map(|a| a.config.binding());
-        let slot = dispatch(app, req, login, ctx);
+        let chunks = Chunks::default();
+        let slot = dispatch(app, req, login, Some(chunks.clone()), ctx);
         app.assistant.inflight = Some((generation, slot));
+        app.assistant.chunks = Some((generation, chunks));
     }
 }
 
@@ -314,17 +400,39 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
             send(app, text, ctx);
         }
     }
+    // The reply's text so far, as it streams in.
+    if let Some((generation, chunks)) = &app.assistant.chunks {
+        let generation = *generation;
+        let piece = chunks.lock().map(|mut c| std::mem::take(&mut *c)).unwrap_or_default();
+        if !piece.is_empty()
+            && let Some(agent) = app.assistant.agent.as_mut()
+        {
+            agent.stream(generation, &piece);
+        }
+    }
     if let Some((generation, slot)) = &app.assistant.inflight
         && let Some(r) = take(slot)
     {
         let generation = *generation;
         app.assistant.inflight = None;
+        app.assistant.chunks = None;
         let failed = r.is_err();
         if let Some(step) = with_agent(app, |a, s| a.receive_result(generation, r, s)) {
             follow(app, step, ctx);
         }
         if failed {
             sync_sign_in(app);
+        }
+    }
+    // Agent threads on this computer: what they did, asked and reported.
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::agentthreads::poll(app, ctx);
+    if let Some((generation, at)) = app.assistant.retry
+        && web_time::Instant::now() >= at
+    {
+        app.assistant.retry = None;
+        if let Some(step) = with_agent(app, |a, _| a.retry(generation)) {
+            follow(app, step, ctx);
         }
     }
     if let Some(slot) = &app.assistant.models_slot
@@ -406,6 +514,7 @@ fn send(app: &mut RustGisApp, text: String, ctx: &egui::Context) {
 
 pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     ensure_loaded(app);
+    sync_skills(app, false);
     let ctx = ui.ctx().clone();
     if app.assistant.catalog_pending
         && let Some(cfg) = app.assistant.agent.as_ref().map(|a| a.config.clone())
@@ -448,6 +557,20 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         a.clear();
                     }
                     app.assistant.inflight = None;
+                    end_threads(app);
+                    app.assistant.chunks = None;
+                    app.assistant.retry = None;
+                }
+                let idle = app.assistant.agent.as_ref().is_some_and(|a| !a.busy());
+                if has_chat
+                    && idle
+                    && ui
+                        .small_button(tl!("Compact"))
+                        .on_hover_text(tl!("Summarise the conversation so far, so a long chat stays within the model's context"))
+                        .clicked()
+                    && let Some(step) = with_agent(app, |a, _| a.compact())
+                {
+                    follow(app, step, &ctx);
                 }
             });
         });
@@ -455,6 +578,11 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let plan = app.assistant.agent.as_ref().is_some_and(|a| a.config.login());
     if plan {
         composer_panel(app, ui, t, busy, &ctx);
+    }
+    // Closed settings look for the agents again when they next open.
+    #[cfg(not(target_arch = "wasm32"))]
+    if !app.assistant.settings {
+        app.assistant.agents_found = None;
     }
     if app.assistant.settings {
         let mut draw = |ui: &mut Ui| {
@@ -621,6 +749,10 @@ fn settings(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     for n in notes {
         ui.label(RichText::new(n).small().color(t.text_dim));
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    local_agents_setting(app, ui, t);
+    #[cfg(not(target_arch = "wasm32"))]
+    skills_setting(app, ui, t);
     if let Some(p) = preset.filter(|p| !p.key_url.is_empty() && !p.login) {
         ui.hyperlink_to(RichText::new(if p.keyless { tl!("Get it") } else { tl!("Get a key") }).small(), p.key_url);
     }
@@ -636,6 +768,9 @@ fn settings(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     if let Some(why) = cfg.missing() {
         ui.label(RichText::new(tl!(why)).small().color(t.amber));
     }
+    // Agents on this computer working on this map through the MCP relay (desktop).
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::connectui::section(app, ui, t);
     if cfg.login() {
         provider::use_catalog(&mut cfg, &app.assistant.catalog, true);
     }
@@ -777,6 +912,153 @@ fn start_login(app: &mut RustGisApp, cfg: &mut Config, another: bool) {
     }
 }
 
+/// Whether the assistant may hand tasks to the agents on this computer (Claude Code, Codex,
+/// Gemini CLI…) through ACP. Off unless the user turns it on; each agent's actions then wait for
+/// the user's approval, unless they choose otherwise.
+#[cfg(not(target_arch = "wasm32"))]
+fn local_agents_setting(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    if let Some(a) = app.assistant.agent.as_mut() {
+        a.set_agents_auto(app.assistant.agents_auto);
+    }
+    if ui.checkbox(&mut app.assistant.local_agents, tl!("Let the assistant hand tasks to agents on this computer")).changed() {
+        app.assistant.agents_found = None;
+        let (found, _) = app.assistant.agents_found.get_or_insert_with(rustgis_assistant::acp::installed);
+        let found: Vec<_> = found.iter().map(|(spec, _)| *spec).collect();
+        save_pref(app, "assistant_local_agents", if app.assistant.local_agents { "on" } else { "off" });
+        let agents = if app.assistant.local_agents { found } else { Vec::new() };
+        if let Some(a) = app.assistant.agent.as_mut() {
+            a.set_harnesses(agents);
+        }
+    }
+    let (found, need_node) = app.assistant.agents_found.get_or_insert_with(rustgis_assistant::acp::installed).clone();
+    let note = if found.is_empty() {
+        tl!("No agents that speak ACP (Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, Cursor, OpenCode, goose) were found on this computer.").to_string()
+    } else {
+        let names: Vec<&str> = found.iter().map(|(spec, _)| spec.label).collect();
+        crate::i18n::fmt(
+            "Found: {names}. An agent works on this map through RustGIS's tools and with its own (web, scripts, files) in a folder of its own, kept in Documents › RustGIS › Agent work. It asks you before each action.",
+            &[("names", &names.join(", "))],
+        )
+    };
+    ui.label(RichText::new(note).small().color(t.text_dim));
+    if found.iter().any(|(spec, command)| {
+        spec.adapter.is_some() && command.first().is_some_and(|c| std::path::Path::new(c).file_stem().is_some_and(|s| s == "npx"))
+    }) {
+        ui.label(
+            RichText::new(tl!(
+                "Claude Code and Codex connect through an ACP adapter. On first use, npx downloads and runs its pinned version from npm."
+            ))
+            .small()
+            .color(t.text_dim),
+        );
+    }
+    if !need_node.is_empty() {
+        let names: Vec<&str> = need_node.iter().map(|spec| spec.label).collect();
+        ui.label(
+            RichText::new(crate::i18n::fmt("{names}: needs Node.js (npx) for its ACP adapter.", &[("names", &names.join(", "))]))
+                .small()
+                .color(t.amber),
+        );
+    }
+    if app.assistant.local_agents && ui.checkbox(&mut app.assistant.agents_auto, tl!("Approve agents' actions without asking")).changed() {
+        save_pref(app, "assistant_agents_auto", if app.assistant.agents_auto { "on" } else { "off" });
+        if let Some(a) = app.assistant.agent.as_mut() {
+            a.set_agents_auto(app.assistant.agents_auto);
+        }
+    }
+    if app.assistant.local_agents && app.assistant.agents_auto {
+        ui.label(
+            RichText::new(tl!("Agents then run commands, change files and use the web on this computer without asking you."))
+                .small()
+                .color(t.red),
+        );
+    }
+}
+
+/// The Skills list: every skill and where it comes from, a switch for each, and adding and
+/// removing the user's (desktop).
+#[cfg(not(target_arch = "wasm32"))]
+fn skills_setting(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    use rustgis_assistant::skills::{self, Places, Source};
+    ui.collapsing(tl!("Skills"), |ui| {
+        // Read once and kept; each frame copies only what the rows show (not the skills' bodies),
+        // and the folders are looked up only when something is done.
+        let (listed, problems) = app.assistant.skills_list.get_or_insert_with(|| skills::list(&Places::here()));
+        let rows: Vec<(String, String, Source, bool)> =
+            listed.iter().map(|l| (l.skill.name.clone(), l.skill.description.clone(), l.skill.source.clone(), l.on)).collect();
+        let problems = problems.clone();
+        let mut done: Option<Result<String, String>> = None;
+        for (name, description, source, on) in &rows {
+            ui.push_id((name, format!("{source:?}")), |ui| { ui.horizontal(|ui| {
+                let mut on = *on;
+                if ui.checkbox(&mut on, name).on_hover_text(description).changed() {
+                    done = Some(skills::set_source_enabled(&Places::here(), name, source, on).map(|()| String::new()));
+                }
+                let from = match source {
+                    Source::BuiltIn => tl!("Built in"),
+                    Source::Plugin(_) => tl!("Plugin"),
+                    Source::User(_) => tl!("Yours"),
+                    Source::Shared(_) => tl!("Shared"),
+                };
+                ui.label(RichText::new(from).small().color(t.text_dim));
+                if matches!(source, Source::User(_)) && ui.small_button(tl!("Remove")).clicked() {
+                    done = Some(skills::remove(&Places::here(), name).map(|()| String::new()));
+                }
+            }); });
+        }
+        for p in &problems {
+            ui.label(RichText::new(p).small().color(t.red));
+        }
+        ui.horizontal(|ui| {
+            let mut picked = None;
+            if ui.button(tl!("Add skill…")).clicked() {
+                picked = rfd::FileDialog::new()
+                    .set_title(tl!("Add skill…"))
+                    .add_filter(tl!("Skill (SKILL.md or .zip)"), &["md", "zip"])
+                    .pick_file();
+            }
+            if ui.button(tl!("Add folder…")).clicked() {
+                picked = rfd::FileDialog::new().set_title(tl!("Add folder…")).pick_folder();
+            }
+            if let Some(path) = picked {
+                done = Some(
+                    skills::add(&Places::here(), &path).map(|names| crate::i18n::fmt("Added: {names}", &[("names", &names.join(", "))])),
+                );
+            }
+            if ui.button(tl!("Open folder")).clicked()
+                && let Some(dir) = Places::here().user
+            {
+                let opened = std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display())).and_then(|()| crate::open_with_system(&dir));
+                if let Err(e) = opened {
+                    done = Some(Err(e));
+                }
+            }
+            // Skills added to the folder by hand.
+            if ui.button(tl!("Refresh")).clicked() {
+                done = Some(Ok(String::new()));
+            }
+        });
+        ui.label(
+            RichText::new(tl!(
+                "Your skills are kept in the skills folder of the app's settings folder. Shared skills (~/.agents/skills) are off until you turn them on."
+            ))
+            .small()
+            .color(t.text_dim),
+        );
+        if let Some(r) = done {
+            app.assistant.skills_message = match r {
+                Ok(m) if m.is_empty() => None,
+                Ok(m) => Some((true, m)),
+                Err(e) => Some((false, e)),
+            };
+            sync_skills(app, true);
+        }
+        if let Some((ok, m)) = &app.assistant.skills_message {
+            ui.label(RichText::new(m).small().color(if *ok { t.text_dim } else { t.red }));
+        }
+    });
+}
+
 /// Recovery text is translated; server diagnostics retain their original wording.
 fn show_error(ui: &mut Ui, error: &rustgis_assistant::Error, t: &Tokens) {
     ui.label(RichText::new(tl!(error.message())).small().color(t.red));
@@ -832,6 +1114,9 @@ fn account_row(_app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, _cfg: &mut Config
 }
 
 fn composer(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, busy: bool, ctx: &egui::Context) {
+    // Agent threads on this computer, working or waiting for a follow-up.
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::agentthreads::list(app, ui, t);
     // An action waiting for approval comes first.
     let pending = app.assistant.agent.as_ref().and_then(|a| a.pending(&app.session));
     if let Some((what, why, can_always)) = pending {
@@ -907,6 +1192,8 @@ fn composer(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, busy: bool, ctx: &egu
                         a.stop();
                     }
                     app.assistant.inflight = None;
+                    app.assistant.retry = None;
+                    app.assistant.chunks = None;
                 }
             } else {
                 let can = !app.assistant.input.trim().is_empty();
@@ -976,11 +1263,18 @@ fn transcript(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, ctx: &egui::Context
                 show_error(ui, e, t);
             }
             Entry::Note(n) => {
-                ui.label(RichText::new(tl!(n)).small().italics().color(t.text_dim));
+                let args: Vec<(&str, &str)> = n.args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                ui.label(RichText::new(crate::i18n::fmt(n.template, &args)).small().italics().color(t.text_dim));
             }
         }
     }
     if agent.waiting() {
+        // The reply so far, as it streams in.
+        if let Some(text) = agent.preview() {
+            markdown(ui, text, t);
+            ui.spinner();
+            return;
+        }
         ui.horizontal(|ui| {
             ui.spinner();
             ui.label(RichText::new(tl!("Thinking…")).small().color(t.text_dim));
@@ -1134,6 +1428,40 @@ mod tests {
         app.run("ui.pane.assistant", serde_json::Value::Null).unwrap();
         app.assistant.settings = true;
         app
+    }
+
+    /// Clicking Stop drops the old UI backoff deadline and streamed chunks before another run.
+    #[test]
+    fn stop_button_clears_retry_deadline_and_chunks() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        let mut config = Config::from_env("custom");
+        config.model = "test".into();
+        let mut agent = Agent::new(config, &app.session);
+        assert!(matches!(agent.ask("hello", &app.session), Step::Send(_)));
+        let response = Ok(HttpResponse { status: 503, body: b"{}".to_vec(), headers: vec![("retry-after".into(), "0".into())] });
+        assert!(matches!(agent.receive_result(agent.generation(), response, &mut app.session), Step::Retry(_)));
+        let generation = agent.generation();
+        app.assistant.agent = Some(agent);
+        app.assistant.retry = Some((generation, web_time::Instant::now()));
+        app.assistant.chunks = Some((generation, Chunks::default()));
+        app.assistant.inflight = Some((generation, Slot::default()));
+        // Render just the composer: no polling or network dispatch is needed to press Stop.
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 160.0)).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                let busy = app.assistant.agent.as_ref().is_some_and(Agent::busy);
+                composer(app, ui, &Tokens::light(), busy, &ctx);
+            },
+            app,
+        );
+        h.run();
+        h.get_by_label("Stop").click();
+        h.step();
+        assert!(h.state().assistant.retry.is_none());
+        assert!(h.state().assistant.chunks.is_none());
+        assert!(h.state().assistant.inflight.is_none());
+        assert!(!h.state().assistant.agent.as_ref().unwrap().busy());
     }
 
     #[test]
@@ -1337,7 +1665,7 @@ mod tests {
         signed_in(&mut app, &c, &ctx);
         assert!(app.assistant.models_slot.is_some());
         let slot = Slot::default();
-        *slot.lock().unwrap() = Some(Ok(HttpResponse { status: 200, request_id: None,
+        *slot.lock().unwrap() = Some(Ok(HttpResponse { status: 200, headers: vec![],
             body: serde_json::json!({"models":[{"slug":"offered", "display_name":"Offered model", "visibility":"list", "supports_reasoning":false}]}).to_string().into_bytes() }));
         app.assistant.models_slot = Some(slot);
         poll(&mut app, &ctx);
@@ -1360,7 +1688,7 @@ mod tests {
         let mut app = plan_app();
         app.services.http = Some(Box::new(|_, _| panic!("the host hook must not receive plan credentials")));
         let request = HttpRequest { method: "GET", url: format!("{}/models", chatgpt::API), headers: vec![], body: None };
-        let slot = dispatch(&mut app, request, Some(chatgpt::Binding::default()), &egui::Context::default());
+        let slot = dispatch(&mut app, request, Some(chatgpt::Binding::default()), None, &egui::Context::default());
         let start = std::time::Instant::now();
         loop {
             if let Some(result) = take(&slot) {

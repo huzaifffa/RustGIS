@@ -56,6 +56,26 @@ fn plugin_strings_use_the_plugins_translations() {
 }
 
 #[test]
+fn start_up_project_strings_have_real_translations() {
+    let keys = [
+        "Last Project",
+        "Choose Project…",
+        "No project opened or saved yet",
+        "What RustGIS opens with: the World Atlas sample, a blank map, a project you choose, or the last project opened or saved.",
+        "RustGIS didn't close properly last time, so it started with the World Atlas instead of your start-up project. Open the project from the Project menu when you're ready.",
+        "The start-up project {path} isn't a RustGIS project file.",
+        "The start-up project {path} didn't open: {error}",
+    ];
+    for l in &LANGUAGES[1..] {
+        let (catalog, _) = parse(l.source);
+        for key in keys {
+            let translated = catalog.get(key).unwrap_or_else(|| panic!("{}: missing {key}", l.code));
+            assert_ne!(translated, key, "{}: untranslated {key}", l.code);
+        }
+    }
+}
+
+#[test]
 fn chatgpt_recovery_and_controls_have_real_translations() {
     use rustgis_assistant::{Error, Recovery};
     let mut keys = vec![
@@ -90,6 +110,90 @@ fn chatgpt_recovery_and_controls_have_real_translations() {
         for key in &keys {
             let translated = catalog.get(*key).unwrap_or_else(|| panic!("{}: missing {key}", l.code));
             assert_ne!(translated, key, "{}: untranslated {key}", l.code);
+        }
+    }
+}
+
+#[test]
+fn assistant_note_translations_are_real_when_available() {
+    for l in &LANGUAGES[1..] {
+        let (m, _) = parse(l.source);
+        for template in rustgis_assistant::provider::NOTE_TEMPLATES {
+            // AGENTS.md permits English fallback for new keys until the maintainer translates.
+            if let Some(tr) = m.get(*template) {
+                assert_ne!(tr, template, "{}: {template:?} isn't translated", l.code);
+            }
+        }
+    }
+}
+
+#[test]
+fn skills_controls_are_in_every_catalog() {
+    let keys = [
+        "Skills",
+        "Built in",
+        "Plugin",
+        "Yours",
+        "Shared",
+        "Add skill…",
+        "Skill (SKILL.md or .zip)",
+        "Add folder…",
+        "Added: {names}",
+        "Skills for the AI Assistant: {names}",
+    ];
+    // Sentences, which no language leaves in English.
+    let sentences = [
+        "Your skills are kept in the skills folder of the app's settings folder. Shared skills (~/.agents/skills) are off until you turn them on.",
+        "The assistant follows a skill's instructions when it uses it. Whatever they say, its commands that need your approval still ask.",
+        "It has no code: nothing in it runs.",
+    ];
+    for l in &LANGUAGES[1..] {
+        let (m, _) = parse(l.source);
+        for key in keys.iter().chain(&sentences) {
+            assert!(m.contains_key(*key), "{}: missing {key:?}", l.code);
+        }
+        for key in sentences {
+            assert_ne!(m.get(key).map(String::as_str), Some(key), "{}: {key:?} isn't translated", l.code);
+        }
+    }
+}
+
+#[test]
+fn letting_agents_control_rustgis_is_in_every_catalog() {
+    let keys = [
+        "Let your Agents Control RustGIS",
+        "Agents on this computer that connect (Claude Code, Codex, Cursor and others) work on the map open here, with RustGIS's tools: they can open and save files and use the web. Scripts and plugin management stay off.",
+        "Add this MCP server to your agent:",
+        "Or run, for Claude Code or Codex:",
+    ];
+    for l in &LANGUAGES[1..] {
+        let (m, _) = parse(l.source);
+        for key in keys {
+            let tr = m.get(key).unwrap_or_else(|| panic!("{}: missing {key:?}", l.code));
+            assert_ne!(tr, key, "{}: {key:?} isn't translated", l.code);
+        }
+    }
+}
+
+#[test]
+fn agents_on_this_computer_are_in_every_catalog() {
+    let keys = [
+        "An agent on this computer asks to:",
+        "Always allow",
+        "Let the assistant hand tasks to agents on this computer",
+        "Found: {names}. An agent works on this map through RustGIS's tools and with its own (web, scripts, files) in a folder of its own, kept in Documents › RustGIS › Agent work. It asks you before each action.",
+        "Approve agents' actions without asking",
+        "Agent threads",
+        "Waiting for your answer",
+        "Idle",
+        "{agent} was stopped by you.",
+        "Agents then run commands, change files and use the web on this computer without asking you.",
+    ];
+    for l in &LANGUAGES[1..] {
+        let (m, _) = parse(l.source);
+        for key in keys {
+            let tr = m.get(key).unwrap_or_else(|| panic!("{}: missing {key:?}", l.code));
+            assert_ne!(tr, key, "{}: {key:?} isn't translated", l.code);
         }
     }
 }
