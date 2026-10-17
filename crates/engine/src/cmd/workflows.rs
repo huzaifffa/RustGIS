@@ -543,7 +543,7 @@ fn interpolate(s: &mut Session, p: &Value) -> CmdResult {
         &e,
         cell,
         f(p, "power").unwrap_or(2.0).clamp(0.5, 10.0),
-        p.get("neighbors").and_then(Value::as_u64).unwrap_or(12) as usize,
+        p.get("neighbors").and_then(Value::as_u64).unwrap_or(12).max(1) as usize,
         &name,
     )?;
     add_raster(s, r)
