@@ -415,10 +415,10 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     };
     let vline = |x: f32, c: Color32| painter.line_segment([pos2(x, area.top()), pos2(x, area.bottom())], Stroke::new(1.0, c));
     let hline = |y: f32, c: Color32| painter.line_segment([pos2(area.left(), y), pos2(area.right(), y)], Stroke::new(1.0, c));
-    for (i, x) in layout.guides.x.iter().enumerate().filter(|(i, _)| moving != Some((true, *i))) {
+    for (_, x) in layout.guides.x.iter().enumerate().filter(|(i, _)| moving != Some((true, *i))) {
         vline(to_screen(page, s, (*x, 0.0)).x, GUIDE_COLOR);
     }
-    for (i, y) in layout.guides.y.iter().enumerate().filter(|(i, _)| moving != Some((false, *i))) {
+    for (_, y) in layout.guides.y.iter().enumerate().filter(|(i, _)| moving != Some((false, *i))) {
         hline(to_screen(page, s, (0.0, *y)).y, GUIDE_COLOR);
     }
     if let (Some(Drag::NewGuide(v) | Drag::Guide(v, _)), Some(p)) = (app.layout.drag, pointer) {
