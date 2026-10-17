@@ -3,11 +3,11 @@
 use geo::{BooleanOps, Buffer, ConvexHull, InteriorPoint, Intersects, MultiPolygon, Orient, Simplify, orient::Direction};
 use rustgis_data::raster::Crs;
 use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value};
-use rustgis_geom::{geodesic_length_m, geodesic_ring_area_m2};
+use rustgis_geom::{Extent, geodesic_length_m, geodesic_ring_area_m2};
 use serde_json::Value as Json;
 
 use crate::convert::{from_line, from_multipolygon, from_point, to_geo, to_multiline, to_multipolygon};
-use crate::{Inputs, Output, ParamKind as K, ParamSpec as P, ToolResult, ToolSpec};
+use crate::{Inputs, Output, OutputLayer, ParamKind as K, ParamSpec as P, ToolResult, ToolSpec};
 
 const UNITS: &[&str] = &["Kilometers", "Meters", "Miles"];
 
@@ -199,6 +199,49 @@ pub static TOOLS: &[ToolSpec] = &[
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
         run: export_features,
+    },
+    ToolSpec {
+        id: "idwInterpolation",
+        name: "IDW Interpolation",
+        toolbox: "Analysis › Interpolation",
+        summary: "Interpolates a raster surface from feature values by inverse distance weighting, as QGIS does.",
+        params: &[
+            P {
+                name: "input",
+                label: "Vector Layer",
+                kind: K::VectorLayer,
+                required: true,
+                default: "",
+                help: "Points, or lines and polygons whose vertices are used as points.",
+            },
+            P { name: "field", label: "Interpolation Attribute", kind: K::NumericField, required: true, default: "", help: "" },
+            P {
+                name: "power",
+                label: "Distance Coefficient P",
+                kind: K::Number,
+                required: false,
+                default: "2",
+                help: "How fast a point's weight falls off with distance (weight = 1/distanceᴾ). 0 averages every point.",
+            },
+            P {
+                name: "extent",
+                label: "Extent",
+                kind: K::Text,
+                required: false,
+                default: "",
+                help: "xmin,ymin,xmax,ymax in degrees; the input's extent when empty.",
+            },
+            P {
+                name: "pixelSize",
+                label: "Pixel Size (°)",
+                kind: K::Number,
+                required: false,
+                default: "",
+                help: "The output cell size in degrees; 300 cells across the extent when empty.",
+            },
+            P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
+        ],
+        run: idw_interpolation,
     },
 ];
 
@@ -611,6 +654,46 @@ fn select_by_attributes(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String
     })
 }
 
+/// The QGIS IDW interpolation: every point weighs on every cell.
+fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    let ds = input(inp, p, "input")?;
+    let field = s(p, "field");
+    let fi = ds.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
+    let mut pts: Vec<(Coord, f64)> = Vec::new();
+    for r in rows(inp, p, "input", ds) {
+        let Some(g) = ds.features.get(r).and_then(|f| f.geometry.as_ref()) else { continue };
+        let Some(v) = ds.value(r, fi).as_f64().filter(|v| v.is_finite()) else { continue };
+        g.for_each_coord(|c| {
+            if c.is_finite() {
+                pts.push((c, v));
+            }
+        });
+    }
+    let extent = match s(p, "extent").trim() {
+        "" => {
+            let mut e = Extent::EMPTY;
+            pts.iter().for_each(|(c, _)| e.expand(*c));
+            // Points in a row span no area: give the grid some.
+            if e.width() > 0.0 && e.height() > 0.0 { e } else { e.padded(0.05, 0.01) }
+        }
+        t => {
+            let v: Vec<f64> = t.split(',').filter_map(|x| x.trim().parse().ok()).filter(|x: &f64| x.is_finite()).collect();
+            let [x0, y0, x1, y1] = v[..] else { return Err("the extent is xmin,ymin,xmax,ymax".into()) };
+            Extent::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
+        }
+    };
+    let cell = num(p, "pixelSize").filter(|c| *c > 0.0).unwrap_or((extent.width().max(extent.height()) / 300.0).max(1e-5));
+    let power = num(p, "power").unwrap_or(2.0);
+    let name = out_name(p, format!("{}_{field}_idw", ds.name));
+    let r = crate::rasterops::idw(&pts, &extent, cell, power, 0, &name)?;
+    let bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
+    let msg = format!("IDW Interpolation: {} × {} cells from {} points", r.width, r.height, pts.len());
+    Ok(ToolResult {
+        output: Output::Layers(vec![OutputLayer::Raster { file_name: format!("{name}.tif"), name, bytes }]),
+        messages: vec![msg],
+    })
+}
+
 fn count_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let polys = input(inp, p, "polygons")?;
     let pts = input(inp, p, "points")?;
@@ -840,6 +923,31 @@ mod tests {
         match d.features[0].geometry.as_ref().unwrap() {
             Geometry::Polygon(polys) => assert_eq!(polys.len(), 1, "overlapping buffers merge into one polygon"),
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn idw_interpolation_writes_a_raster() {
+        let m = inputs();
+        let r =
+            crate::run("idwInterpolation", &m, &serde_json::json!({"input": "pts", "field": "v", "extent": "0,0,2,2", "pixelSize": 0.5}))
+                .unwrap_or_else(|e| panic!("{e}"));
+        let Output::Layers(out) = r.output else { panic!("expected layers") };
+        let Some(OutputLayer::Raster { name, file_name, bytes }) = out.first() else { panic!("expected a raster: {out:?}") };
+        assert_eq!(name, "pts_v_idw");
+        let g = rustgis_data::raster::read_bytes(file_name, bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((g.width, g.height), (4, 4));
+        // Every value lies between the inputs', nearest the point it sits closest to.
+        let d = &g.bands[0].data;
+        assert!(d.iter().all(|v| (1.0..=3.0).contains(v)), "{d:?}");
+        assert!(d[12] < d[3], "south-west, by the 1, is below north-east, by the 2: {d:?}");
+        // A text field gives no values; a bad extent or power is refused.
+        assert!(crate::run("idwInterpolation", &m, &serde_json::json!({"input": "polys", "field": "k"})).is_err(), "text field");
+        for p in [serde_json::json!({"extent": "1,2,3"}), serde_json::json!({"power": -1})] {
+            let mut p = p;
+            p["input"] = "pts".into();
+            p["field"] = "v".into();
+            assert!(crate::run("idwInterpolation", &m, &p).is_err(), "{p}");
         }
     }
 

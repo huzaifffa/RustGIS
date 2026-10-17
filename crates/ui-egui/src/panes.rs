@@ -2428,6 +2428,7 @@ pub fn tool_icon(id: &str) -> &'static str {
         "calculateGeometry" => "calc_geom",
         "summaryStatistics" => "stats",
         "exportFeatures" => "export_layer",
+        "idwInterpolation" => "relief",
         _ => "tools",
     }
 }

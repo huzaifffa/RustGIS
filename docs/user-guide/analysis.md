@@ -39,8 +39,14 @@ result is added to the map, and the run is listed under **Analyze › History**.
 | Select Layer By Location / Attribute | Data Management › Layers and Table Views |
 | Summarize Within, Summary Statistics | Analysis › Summarize / Statistics |
 | Export Features | Conversion |
+| IDW Interpolation | Analysis › Interpolation |
 
 Tools honour the current selection: with features selected, only those are processed.
+
+**IDW Interpolation** works like the QGIS tool of the same name: every point weighs on every
+cell by 1/distanceᴾ, where P is the distance coefficient (2 by default). Lines and polygons
+contribute their vertices. Leave the extent empty to use the input's, or give it as
+`xmin,ymin,xmax,ymax` in degrees. The result is a Float32 GeoTIFF layer.
 
 ## GeoLibre tools
 
