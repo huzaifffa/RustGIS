@@ -55,6 +55,9 @@ pub struct Popup {
     pub at: Coord,
     /// Which of the identified features is shown (Visible Layers identifies several).
     pub index: usize,
+    /// The map it was opened on (the project's `active_map` then): layer and feature ids belong to
+    /// a map, and a duplicated map has the same ones.
+    pub map: usize,
 }
 
 /// A notice shown as a toast.
@@ -102,6 +105,8 @@ pub struct MapView {
     /// The magnifying lens follows the pointer.
     pub magnifier: bool,
     pub popup: Option<Popup>,
+    /// The session revision the popup was last checked against the map at ([`follow_popup`]).
+    popup_rev: u64,
     /// A map or layout waiting for the user to confirm its deletion.
     pub deleting: Option<Deletion>,
     pub pointer_lonlat: Option<Coord>,
@@ -174,6 +179,7 @@ impl Default for MapView {
             vertex_drag: None,
             magnifier: false,
             popup: None,
+            popup_rev: 0,
             deleting: None,
             pointer_lonlat: None,
             menu_lonlat: None,
@@ -1194,7 +1200,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
                         if let (Some(id), Some(row)) = (v["layerId"].as_u64(), v["row"].as_u64()) {
                             let _ = app.session.run("select.rows", &json!({"layer": id, "rows": [row]}));
                         }
-                        Some(Popup { info: v, at: c, index: 0 })
+                        Some(Popup { info: v, at: c, index: 0, map: app.session.project.active_map })
                     }
                     _ => {
                         let _ = app.session.run("select.clear", &Value::Null);
@@ -1674,7 +1680,77 @@ fn north_arrow(p: &egui::Painter, rect: Rect, t: &Tokens, bearing: f64, pitch: f
     p.text(at(0.0, 11.5), Align2::CENTER_CENTER, "N", semibold(8.5), t.text);
 }
 
+/// Where a popup result's feature lives.
+enum Home<'a> {
+    /// Nothing to check it against (no layer id).
+    NoLayer,
+    /// Its layer has been removed.
+    LayerGone,
+    Layer(&'a rustgis_engine::map::Layer),
+}
+
+/// Keeps the popup to features still on the map (#465): the ones deleted, undone away or in a
+/// removed layer leave its list, and it closes when the one it shows is gone or another map is in
+/// view. Checked once per change of the session.
+fn follow_popup(app: &mut RustGisApp) {
+    if app.map.popup_rev == app.session.revision {
+        return;
+    }
+    app.map.popup_rev = app.session.revision;
+    let active = app.session.project.active_map;
+    let map = app.session.map();
+    let Some(pp) = &mut app.map.popup else { return };
+    // Another map in view, however it came (a tab, the Browser, a command).
+    if pp.map != active {
+        app.map.popup = None;
+        return;
+    }
+    let results = pp.info["results"].as_array().cloned().unwrap_or_else(|| vec![pp.info.clone()]);
+    let home = |r: &Value| match r.get("layerId").and_then(Value::as_u64) {
+        None => Home::NoLayer,
+        Some(id) => u32::try_from(id).ok().and_then(|id| map.layer(id)).map_or(Home::LayerGone, Home::Layer),
+    };
+    // The feature ids sought in each layer, found in one pass over it.
+    let mut sought: std::collections::HashMap<u32, std::collections::HashSet<u64>> = Default::default();
+    for r in &results {
+        if let (Home::Layer(l), Some(fid)) = (home(r), r["fid"].as_u64()) {
+            sought.entry(l.id).or_default().insert(fid);
+        }
+    }
+    let mut found = std::collections::HashSet::new();
+    for (id, fids) in &sought {
+        let features = map.layer(*id).map_or(&[][..], |l| l.dataset.features.as_slice());
+        found.extend(features.iter().filter(|f| fids.contains(&f.id)).map(|f| (*id, f.id)));
+    }
+    let here: Vec<bool> = results
+        .iter()
+        .map(|r| match home(r) {
+            Home::NoLayer => true,
+            Home::LayerGone => false,
+            // A streamed layer holds a window of its features: one outside it isn't gone.
+            Home::Layer(l) => r["fid"].as_u64().is_none_or(|fid| l.dataset.windowed || found.contains(&(l.id, fid))),
+        })
+        .collect();
+    let index = pp.index.min(results.len().saturating_sub(1));
+    if here.get(index) != Some(&true) {
+        app.map.popup = None;
+        return;
+    }
+    if here.iter().all(|h| *h) {
+        return;
+    }
+    let shown = results.get(index).cloned();
+    let kept: Vec<Value> = results.into_iter().zip(here).filter(|(_, h)| *h).map(|(r, _)| r).collect();
+    let Some(mut info) = kept.first().cloned() else { return };
+    pp.index = shown.and_then(|s| kept.iter().position(|k| *k == s)).unwrap_or(0);
+    if let Value::Object(o) = &mut info {
+        o.insert("results".into(), Value::Array(kept));
+    }
+    pp.info = info;
+}
+
 fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
+    follow_popup(app);
     let Some(pp) = &app.map.popup else { return };
     let t = Tokens::get(ui.ctx());
     let Some(anchor) = lonlat_to_screen(app, rect, pp.at) else { return };
