@@ -1433,6 +1433,25 @@ mod tests {
         assert_eq!(app.layout.selected, None);
     }
 
+    /// Element ids are per layout: opening another layout ends the selection, so Delete or
+    /// Ctrl+D never reaches the element of the same id there.
+    #[test]
+    fn opening_another_layout_clears_the_selection() {
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "First"})).unwrap();
+        app.run("layout.new", json!({"name": "Second"})).unwrap();
+        app.run("layout.activate", json!({"name": "First"})).unwrap();
+        let first = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[first].elements.iter().find(|e| e.name == "Title").unwrap().id;
+        app.layout.selected = Some(title);
+        app.run("layout.removeElement", json!({"element": 999_999})).ok();
+        assert_eq!(app.layout.selected, Some(title), "a command in the same layout keeps it");
+        app.run("layout.activate", json!({"name": "Second"})).unwrap();
+        assert_ne!(app.session.active_layout, Some(first));
+        assert!(app.session.project.layouts[app.session.active_layout.unwrap()].element(title).is_some(), "the id exists there too");
+        assert_eq!(app.layout.selected, None);
+    }
+
     #[test]
     fn dragged_elements_snap_to_the_nearest_line() {
         let lines = (vec![0.0, 100.0, 150.0], vec![0.0, 50.0]);

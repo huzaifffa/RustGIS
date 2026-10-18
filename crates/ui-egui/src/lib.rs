@@ -1220,6 +1220,10 @@ impl RustGisApp {
             Some((task.steps.len(), at.map(|s| (s.title.clone(), s.instructions.clone(), s.command.clone()))))
         };
         let steps_before = (matches!(id, "edit.undo" | "edit.redo") && self.ws.task_edit.is_some()).then(|| task_steps(self)).flatten();
+        // Element ids are per layout: a selection made in one layout must not reach an element
+        // of another, so it ends when the open layout changes (or layouts come and go).
+        let open_layout = |app: &Self| (app.session.active_layout, app.session.project.layouts.len());
+        let layout_before = open_layout(self);
         let r = if id.starts_with("ui.") { self.run_ui(id, &params) } else { self.session.run(id, &params) };
         if let Err(e) = &r {
             log::info!("{id}: {e}");
@@ -1260,6 +1264,9 @@ impl RustGisApp {
                     _ => {}
                 }
             }
+        }
+        if open_layout(self) != layout_before {
+            self.layout.selected = None;
         }
         if r.is_ok() && matches!(id, "edit.undo" | "edit.redo") {
             self.map.vertex = None;
