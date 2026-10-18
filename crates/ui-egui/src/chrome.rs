@@ -229,29 +229,44 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
             ui.painter().line_segment([pos2(r.min.x - 10.0, r.min.y), pos2(r.max.x + 10.0, r.min.y)], Stroke::new(1.0, t.border));
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing = vec2(10.0, 0.0);
-                // Scale.
+                // Scale: typed (1:12,345, 12345, 25k, …) and set with Enter, or picked from the
+                // list. Esc, or clicking away, leaves the map's scale as it was.
                 let scale = app.session.scale();
-                egui::ComboBox::from_id_salt("status_scale")
-                    .selected_text(format!("1:{}", crate::ribbon::fmt_thousands(scale.round())))
-                    .width(130.0)
-                    .show_ui(ui, |ui| {
-                        for s in [
-                            5_000.0,
-                            25_000.0,
-                            100_000.0,
-                            500_000.0,
-                            1_000_000.0,
-                            5_000_000.0,
-                            10_000_000.0,
-                            25_000_000.0,
-                            50_000_000.0,
-                            100_000_000.0,
-                        ] {
-                            if ui.selectable_label(false, format!("1:{}", crate::ribbon::fmt_thousands(s))).clicked() {
-                                let _ = app.run("map.setScale", json!({"scale": s}));
-                            }
+                let shown = format!("1:{}", crate::ribbon::fmt_thousands(scale.round()));
+                let mut text = app.ui.scale_text.take().unwrap_or_else(|| shown.clone());
+                let r = ui
+                    .add(egui::TextEdit::singleline(&mut text).id_salt("status_scale").desired_width(96.0))
+                    .on_hover_text(tl!("Type a scale, such as 1:12,345, 12345 or 25k, and press Enter"));
+                if r.has_focus() {
+                    app.ui.scale_text = Some(text);
+                } else if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && text != shown {
+                    match parse_scale(&text) {
+                        Some(s) => {
+                            let _ = app.run("map.setScale", json!({"scale": s}));
                         }
-                    });
+                        None => app.session.notify(crate::i18n::fmt("'{text}' isn't a scale: type one such as 1:12,345", &[("text", &text)]), true),
+                    }
+                }
+                let presets = ui.add(egui::Button::new("▾").small().frame(false)).on_hover_text(tl!("Common scales"));
+                egui::Popup::menu(&presets).show(|ui| {
+                    for s in [
+                        5_000.0,
+                        25_000.0,
+                        100_000.0,
+                        500_000.0,
+                        1_000_000.0,
+                        5_000_000.0,
+                        10_000_000.0,
+                        25_000_000.0,
+                        50_000_000.0,
+                        100_000_000.0,
+                    ] {
+                        if ui.selectable_label(false, format!("1:{}", crate::ribbon::fmt_thousands(s))).clicked() {
+                            let _ = app.run("map.setScale", json!({"scale": s}));
+                            ui.close();
+                        }
+                    }
+                });
                 // The flat map's bearing and pitch (the globe has neither); clicking them on a
                 // turned or tilted map faces north and looks straight down again.
                 if !app.session.map().projection.is_globe() {
@@ -370,6 +385,27 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
 fn sep(ui: &mut Ui, t: &Tokens) {
     let (r, _) = ui.allocate_exact_size(vec2(1.0, 14.0), Sense::hover());
     ui.painter().rect_filled(r, 0.0, t.border_strong);
+}
+
+/// A map scale typed into the status bar, as its denominator: `1:12,345`, `1/12345`, `12345`,
+/// `12 345`, `12'345`, `12.345` (dots grouping thousands, as many languages write it), `25k` or
+/// `2.5m`. None unless it's a positive number.
+fn parse_scale(text: &str) -> Option<f64> {
+    let t: String = text.to_lowercase().chars().filter(|c| !c.is_whitespace() && !matches!(c, ',' | '_' | '\'' | '’')).collect();
+    let t = t.strip_prefix("1:").or_else(|| t.strip_prefix("1/")).unwrap_or(&t);
+    let (num, unit) = match (t.strip_suffix('k'), t.strip_suffix('m')) {
+        (Some(n), _) => (n, 1e3),
+        (_, Some(n)) => (n, 1e6),
+        _ => (t, 1.0),
+    };
+    let mut groups = num.split('.');
+    let grouped = unit == 1.0
+        && groups.next().is_some_and(|g| (1..=3).contains(&g.len()))
+        && num.contains('.')
+        && groups.all(|g| g.len() == 3 && g.bytes().all(|b| b.is_ascii_digit()));
+    let num = if grouped { num.replace('.', "") } else { num.to_string() };
+    let v = num.parse::<f64>().ok()? * unit;
+    (v.is_finite() && v > 0.0).then_some(v)
 }
 
 /// Global keyboard shortcuts.
@@ -756,6 +792,29 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_scales_read_as_people_write_them() {
+        for (text, want) in [
+            ("1:12,345", 12_345.0),
+            ("1:12345", 12_345.0),
+            ("1 : 25 000", 25_000.0),
+            ("1/50000", 50_000.0),
+            ("12345", 12_345.0),
+            ("12'345", 12_345.0),
+            ("12.345", 12_345.0),
+            ("1.234.567", 1_234_567.0),
+            ("25k", 25_000.0),
+            ("2.5M", 2_500_000.0),
+            ("1:1", 1.0),
+            ("  7500  ", 7_500.0),
+        ] {
+            assert_eq!(parse_scale(text), Some(want), "{text}");
+        }
+        for text in ["", "1:", "abc", "0", "1:0", "-5000", "1:-5000", "inf", "NaN", "12.34.5", "k"] {
+            assert_eq!(parse_scale(text), None, "{text}");
+        }
+    }
 
     #[test]
     fn header_without_a_unified_title_bar_keeps_its_usual_size() {

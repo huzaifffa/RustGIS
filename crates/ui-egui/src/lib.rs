@@ -497,6 +497,8 @@ pub struct UiState {
     pub open_url: Option<String>,
     /// An image to put on the system clipboard at the end of the frame.
     pub copy_image: Option<egui::ColorImage>,
+    /// The scale being typed into the status bar, while its box has focus.
+    pub scale_text: Option<String>,
 }
 
 impl UiState {
@@ -596,6 +598,7 @@ impl Default for UiState {
             layer_filter_hid: None,
             layers_view: LayersView::DrawingOrder,
             dynamic_text: None,
+            scale_text: None,
         }
     }
 }
