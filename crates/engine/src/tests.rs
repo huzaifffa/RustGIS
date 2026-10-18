@@ -7117,12 +7117,15 @@ fn layout_elements_duplicate_offset_on_top_and_undo() {
     // A given offset; the next copy takes the next free name.
     let r = s.run("layout.duplicateElement", &json!({"element": legend.id, "dx": 0, "dy": -20})).unwrap();
     assert_eq!(r["name"], "Legend 3");
-    let third = s.project.layouts[li].element(r["element"].as_u64().unwrap() as u32).unwrap();
+    let third_id = r["element"].as_u64().unwrap() as u32;
+    let third = s.project.layouts[li].element(third_id).unwrap();
     assert_eq!((third.x, third.y), (legend.x, legend.y - 20.0));
     for bad in [json!({}), json!({"element": 9999}), json!({"element": legend.id, "dx": 1e9})] {
         assert!(s.run("layout.duplicateElement", &bad).is_err(), "{bad}");
     }
     s.run("edit.undo", &Value::Null).unwrap();
+    let l = &s.project.layouts[li];
+    assert!(l.element(third_id).is_none() && l.element(id).is_some(), "one undo removes the last copy only");
     s.run("edit.undo", &Value::Null).unwrap();
     assert!(s.project.layouts[li].element(id).is_none(), "undone");
 }
