@@ -242,7 +242,8 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                     edit.state.store(ui.ctx(), edit.response.id);
                 }
                 let r = edit.response.response.on_hover_text(tl!("Type a scale, such as 1:12,345, 12345 or 25k, and press Enter"));
-                if r.has_focus() {
+                // The box's own focus, not the window's: switching windows keeps a half-typed scale.
+                if ui.ctx().memory(|m| m.has_focus(r.id)) {
                     app.ui.scale_text = Some(text);
                 } else if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && text != shown {
                     match parse_scale(&text) {
@@ -824,6 +825,10 @@ mod tests {
             ("12'345", 12_345.0),
             ("12.345", 12_345.0),
             ("1.234.567", 1_234_567.0),
+            // A dot before exactly three digits groups thousands; otherwise it's a decimal point.
+            ("1.234", 1_234.0),
+            ("1.5", 1.5),
+            ("12.5", 12.5),
             ("25k", 25_000.0),
             ("2.5M", 2_500_000.0),
             ("1:1", 1.0),
