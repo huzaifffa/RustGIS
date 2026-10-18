@@ -234,9 +234,14 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 let scale = app.session.scale();
                 let shown = format!("1:{}", crate::ribbon::fmt_thousands(scale.round()));
                 let mut text = app.ui.scale_text.take().unwrap_or_else(|| shown.clone());
-                let r = ui
-                    .add(egui::TextEdit::singleline(&mut text).id_salt("status_scale").desired_width(96.0))
-                    .on_hover_text(tl!("Type a scale, such as 1:12,345, 12345 or 25k, and press Enter"));
+                let mut edit = egui::TextEdit::singleline(&mut text).id_salt("status_scale").desired_width(96.0).show(ui);
+                // Clicking in selects the scale, so typing replaces it.
+                if edit.response.gained_focus() {
+                    let end = edit.galley.text().chars().count();
+                    edit.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(end))));
+                    edit.state.store(ui.ctx(), edit.response.id);
+                }
+                let r = edit.response.response.on_hover_text(tl!("Type a scale, such as 1:12,345, 12345 or 25k, and press Enter"));
                 if r.has_focus() {
                     app.ui.scale_text = Some(text);
                 } else if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && text != shown {
@@ -389,9 +394,21 @@ fn sep(ui: &mut Ui, t: &Tokens) {
 
 /// A map scale typed into the status bar, as its denominator: `1:12,345`, `1/12345`, `12345`,
 /// `12 345`, `12'345`, `12.345` (dots grouping thousands, as many languages write it), `25k` or
-/// `2.5m`. None unless it's a positive number.
+/// `2.5m`. None unless it's a plain number of at least 1: no exponents, and commas or
+/// apostrophes only between groups of three digits (`1:2,5m` is a typo, not 25 million).
 fn parse_scale(text: &str) -> Option<f64> {
-    let t: String = text.to_lowercase().chars().filter(|c| !c.is_whitespace() && !matches!(c, ',' | '_' | '\'' | '’')).collect();
+    let t: String = text.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    let chars: Vec<char> = t.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if matches!(c, ',' | '\'' | '’') {
+            let before = i.checked_sub(1).and_then(|j| chars.get(j)).is_some_and(|c| c.is_ascii_digit());
+            let group = chars.get(i + 1..i + 4).is_some_and(|g| g.iter().all(|c| c.is_ascii_digit()));
+            if !before || !group || chars.get(i + 4).is_some_and(|c| c.is_ascii_digit()) {
+                return None;
+            }
+        }
+    }
+    let t: String = t.chars().filter(|c| !matches!(c, ',' | '_' | '\'' | '’')).collect();
     let t = t.strip_prefix("1:").or_else(|| t.strip_prefix("1/")).unwrap_or(&t);
     let (num, unit) = match (t.strip_suffix('k'), t.strip_suffix('m')) {
         (Some(n), _) => (n, 1e3),
@@ -404,8 +421,11 @@ fn parse_scale(text: &str) -> Option<f64> {
         && num.contains('.')
         && groups.all(|g| g.len() == 3 && g.bytes().all(|b| b.is_ascii_digit()));
     let num = if grouped { num.replace('.', "") } else { num.to_string() };
+    if !num.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
     let v = num.parse::<f64>().ok()? * unit;
-    (v.is_finite() && v > 0.0).then_some(v)
+    (v.is_finite() && v >= 1.0).then_some(v)
 }
 
 /// Global keyboard shortcuts.
@@ -811,7 +831,10 @@ mod tests {
         ] {
             assert_eq!(parse_scale(text), Some(want), "{text}");
         }
-        for text in ["", "1:", "abc", "0", "1:0", "-5000", "1:-5000", "inf", "NaN", "12.34.5", "k"] {
+        for text in [
+            "", "1:", "abc", "0", "1:0", "-5000", "1:-5000", "inf", "NaN", "12.34.5", "k", "1e5", "1:5e300", "0.5", "1:2,5m", "1:12,34",
+            ",345", "12,3456",
+        ] {
             assert_eq!(parse_scale(text), None, "{text}");
         }
     }
