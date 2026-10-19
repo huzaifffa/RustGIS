@@ -28,6 +28,7 @@ mod embeddingsui;
 mod failureui;
 mod geocodeui;
 mod globe_drape;
+mod graphicformat;
 pub mod icons;
 mod layoutview;
 #[cfg(not(target_arch = "wasm32"))]
@@ -59,6 +60,7 @@ mod textform;
 pub mod theme;
 mod tilt_drape;
 mod tilt_settle;
+mod timebar;
 mod update;
 mod vertexedit;
 mod webdataui;
@@ -672,11 +674,15 @@ pub struct RustGisApp {
     pub gp: panes::GpForm,
     pub table: table::TableState,
     pub layout: layoutview::LayoutView,
+    /// The text graphic the Format pane edits (#516).
+    pub(crate) graphic_format: graphicformat::GraphicFormat,
     pub forms: editpanes::Forms,
     pub workflow: analysispane::Workflow,
     /// ModelBuilder's view: the model on its canvas.
     pub mb: modelbuilder::ModelBuilder,
     pub ws: workspacepanes::WorkspaceState,
+    /// The time slider bar.
+    pub time: timebar::TimeBarState,
     /// The Plugin Manager and plugin downloads.
     pub plugins: pluginsui::PluginsState,
     /// Help › Check for Updates.
@@ -752,10 +758,12 @@ impl RustGisApp {
             gp: panes::GpForm::default(),
             table: table::TableState::default(),
             layout: layoutview::LayoutView::default(),
+            graphic_format: graphicformat::GraphicFormat::default(),
             forms: editpanes::Forms::default(),
             workflow: analysispane::Workflow::default(),
             mb: modelbuilder::ModelBuilder::default(),
             ws: workspacepanes::WorkspaceState::default(),
+            time: timebar::TimeBarState::default(),
             plugins: pluginsui::PluginsState::default(),
             update: update::UpdateState::default(),
             reports: reportpane::ReportState::default(),
@@ -1605,6 +1613,11 @@ impl RustGisApp {
             "ui.gp.open" => {
                 let tool = p.get("tool").and_then(Value::as_str).and_then(rustgis_engine::analysis::tool);
                 self.gp.open(tool.map(|t| t.id), &self.session);
+                // The values to start from, by parameter name (a run opened again from the History
+                // pane, #539): over the form's own.
+                if let Some(given) = p.get("values").and_then(Value::as_object) {
+                    self.gp.fill(given);
+                }
                 // A standalone table to run the tool on, by its id.
                 if let Some(id) = p.get("table").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) {
                     self.gp.pick_table(id, &self.session);
@@ -2505,6 +2518,9 @@ impl RustGisApp {
                     return self.run(cmd, json!({"path": path}));
                 }
             }
+            "ui.timeSlider" => return timebar::toggle(self),
+            "ui.timePlay" => return timebar::play(self),
+            "ui.timeExport" => return timebar::export(self),
             "ui.animationPlay" => {
                 if self.session.map().animation.len() < 2 {
                     return Err("add at least two keyframes".into());
@@ -2641,7 +2657,8 @@ impl RustGisApp {
                     zarrui::connect(self);
                 }
             }
-            // Edit › Dynamic Text: the text tool, its dialog starting with one of the map's values.
+            // Edit › Dynamic Text: the text tool, the text it places starting with one of the map's
+            // values.
             "ui.dynamicText" => {
                 let text = p.get("text").and_then(Value::as_str).unwrap_or("");
                 let token = rustgis_engine::map::graphics::TOKENS
@@ -2651,6 +2668,22 @@ impl RustGisApp {
                     .ok_or_else(|| format!("no dynamic text '{text}' (one of {{map}}, {{scale}}, {{date}}, …)"))?;
                 self.run("tool.set", json!({"tool": "graphicText"}))?;
                 self.ui.dynamic_text = Some(token);
+            }
+            // A text graphic has no dialog any more (#516): by its layer and row it opens in the
+            // Format pane; at `lon`/`lat` it is placed there (with `text`, else "Text") and opens.
+            "ui.dialog" if p.get("name").and_then(Value::as_str) == Some("graphicText") => {
+                let num = |k: &str| p.get(k).and_then(Value::as_f64);
+                match (p.get("layer").and_then(Value::as_u64), p.get("row").and_then(Value::as_u64), num("lon"), num("lat")) {
+                    (Some(layer), Some(row), ..) => {
+                        let (layer, row) = (u32::try_from(layer).unwrap_or(u32::MAX), usize::try_from(row).unwrap_or(usize::MAX));
+                        graphicformat::edit(self, layer, row)?;
+                    }
+                    (.., Some(lon), Some(lat)) => {
+                        let text: Option<String> = p.get("text").and_then(Value::as_str).map(|t| t.chars().take(2000).collect());
+                        graphicformat::place(self, lon, lat, text.as_deref())?;
+                    }
+                    _ => return Err("give the text's layer and row, or the lon and lat to place one".into()),
+                }
             }
             "ui.dialog" => {
                 let which = p.get("name").and_then(Value::as_str).unwrap_or("");
@@ -2680,29 +2713,6 @@ impl RustGisApp {
                     return Ok(Value::Null);
                 }
                 self.dialogs.open(which, &self.session)?;
-                // The text graphic dialog remembers where the map was clicked.
-                if which == "graphicText" {
-                    self.dialogs.a = p.get("lon").and_then(Value::as_f64).map(|v| v.to_string()).unwrap_or_default();
-                    self.dialogs.b = p.get("lat").and_then(Value::as_f64).map(|v| v.to_string()).unwrap_or_default();
-                    // Dynamic Text starts it with the value picked.
-                    if let Some(t) = p.get("text").and_then(Value::as_str) {
-                        self.dialogs.text = t.chars().take(2000).collect();
-                    }
-                    // A placed text to edit (its layer and row), starting from its text and size.
-                    if let (Some(layer), Some(row)) = (p.get("layer").and_then(Value::as_u64), p.get("row").and_then(Value::as_u64)) {
-                        use rustgis_engine::map::graphics;
-                        let l = u32::try_from(layer).ok().and_then(|id| self.session.map().layer(id)).filter(|l| l.graphics);
-                        let found = l
-                            .zip(usize::try_from(row).ok())
-                            .and_then(|(l, r)| Some((graphics::label(&l.dataset, r)?.to_string(), graphics::font_size(&l.dataset, r))));
-                        let Some((text, size)) = found else {
-                            self.dialogs.open = None;
-                            return Err(tl!("no text graphic there").to_string());
-                        };
-                        (self.dialogs.mode, self.dialogs.a, self.dialogs.b) = ("edit", layer.to_string(), row.to_string());
-                        (self.dialogs.text, self.dialogs.size) = (text, f64::from(size));
-                    }
-                }
                 // Rename Map / Rename Layout remember which one (`target`, by name; default the
                 // one in view), so renaming another from the Browser leaves the view alone.
                 if matches!(which, "renameMap" | "renameLayout") {
@@ -3181,12 +3191,15 @@ impl RustGisApp {
             chrome::status_bar(self, ui);
             panes::show(self, ui);
             table::show(self, ui);
+            timebar::show(self, ui);
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |ui| {
                 mapview::show(self, ui);
             });
         }
-        // Text typed into a layout element's field the Format pane no longer shows.
+        // Text typed into a layout element's field, or a text graphic's, the Format pane no
+        // longer shows.
         layoutview::save_drafts(self);
+        graphicformat::save_draft(self);
         dialogs::show(self, &ctx);
         mapview::confirm_delete(self, &ctx);
         pluginsui::show(self, &ctx);

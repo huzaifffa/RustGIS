@@ -635,8 +635,19 @@ impl Chunks {
         let c = c % self.per_plane.max(1);
         let (x0, y0) = ((c % self.across) * self.cw, (c / self.across) * self.ch);
         let rows = self.ch.min(self.h.saturating_sub(y0));
-        // The chunk's row length: the full tile width when padded, else the data width.
-        let stride = (values.len() / (rows as usize).max(1) / self.samples.max(1)).max(1);
+        // The chunk's row length: the data width, or the full tile width when padded. The tiff
+        // crate gives a bottom tile of every band after the first, when the bands are stored
+        // apart, its padding rows too (issue #544), so the row count can't tell it alone. Where two
+        // shapes have the same size, the data width wins: both the tiff crate and our LZW decoder
+        // return chunks as wide as the data.
+        let per_pixel = self.samples.max(1);
+        let dw = self.cw.min(self.w.saturating_sub(x0)) as usize;
+        let shapes = [(dw, rows), (dw, self.ch), (self.cw as usize, rows), (self.cw as usize, self.ch)];
+        let stride = shapes
+            .iter()
+            .find(|(cols, r)| cols.saturating_mul(*r as usize).saturating_mul(per_pixel) == values.len())
+            .map_or(values.len() / (rows as usize).max(1) / per_pixel, |(cols, _)| *cols)
+            .max(1);
         let mut y = y0.div_ceil(k) * k;
         while y < y0 + rows {
             let mut x = x0.div_ceil(k) * k;
@@ -912,11 +923,23 @@ fn read_limited(r: Reader<'_>, name: &str, max: usize, open: Option<Opener<'_>>)
     // in RGBI orthophotos) a tile row at a time, and writes a padded edge tile's whole width into
     // the image: past its edge, over the start of the next row (issue #162). Such tiled images
     // are read a tile at a time, as their chunks come back only as wide as the image.
-    let extra_samples = !planar && samples(&mut dec) > nbands && dec.find_tag_unsigned::<u32>(Tag::TileWidth).ok().flatten().is_some();
+    let tile_rows = dec.find_tag_unsigned::<u32>(Tag::TileLength).ok().flatten();
+    let tiled = dec.find_tag_unsigned::<u32>(Tag::TileWidth).ok().flatten().is_some();
+    let extra_samples = !planar && samples(&mut dec) > nbands && tiled;
+    // The decoder asserts (panics) on the padded bottom tiles of the later bands of a tiled image
+    // whose bands are stored apart, read whole (issue #544): such an image is read a tile at a
+    // time, which can't be done below 8 bits a sample.
+    let planar_tiles = planar && nbands > 1 && tiled && bits(&mut dec) >= 8;
+    // `padded`: padding rows at the bottom. Right-edge padding is fine: the decoder places it by
+    // the tile's column, which is right in every band.
+    let padded = tile_rows.is_none_or(|t| t == 0 || h % t != 0);
+    if planar && nbands > 1 && tiled && !planar_tiles && decimate_by == 1 && padded {
+        return Err(err("tiled bands stored apart at fewer than 8 bits a sample aren't supported"));
+    }
     // A large image, from a file, is read a chunk at a time on several threads (not one of
     // fewer than 8 bits a sample, whose chunks pack several pixels to a byte).
     let chunked = open.is_some() && n >= 1 << 20 && bits(&mut dec) >= 8;
-    let whole = if decimate_by > 1 || extra_samples || chunked {
+    let whole = if decimate_by > 1 || extra_samples || planar_tiles || chunked {
         None
     } else {
         let mut buf = DecodingResult::U8(Vec::new());
@@ -1688,6 +1711,105 @@ mod tests {
         let r = read_limited(reader(std::io::Cursor::new(&coarse)).unwrap(), "rgbi", 2_000, None).unwrap();
         assert_eq!((r.width, r.height, r.overview), (20, 20, Some((40, 40))));
         check(&r, 2);
+    }
+
+    /// A `w` × `h` RGB image in `tw` × `th` tiles, uncompressed, its bands stored apart
+    /// (planar configuration 2): every tile of band 0, then of band 1, then of band 2. The
+    /// samples are bytes whatever `bits` says.
+    fn planar_tiled(w: u32, h: u32, (tw, th): (u32, u32), bits: u16, pixel: impl Fn(u32, u32, u32) -> u8) -> Vec<u8> {
+        let mut out = vec![b'I', b'I', 42, 0, 0, 0, 0, 0];
+        let (across, down) = (w.div_ceil(tw), h.div_ceil(th));
+        let mut offsets = Vec::new();
+        for b in 0..3 {
+            for t in 0..across * down {
+                offsets.push(out.len() as u32);
+                for p in 0..tw * th {
+                    let (x, y) = ((t % across) * tw + p % tw, (t / across) * th + p / tw);
+                    out.push(if x < w && y < h { pixel(b, x, y) } else { 0 });
+                }
+            }
+        }
+        let shorts = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let longs = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let doubles = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let counts = vec![tw * th; offsets.len()];
+        let mut e: Vec<(u16, u16, u32, Vec<u8>)> = vec![
+            (256, 4, 1, longs(&[w])),
+            (257, 4, 1, longs(&[h])),
+            (258, 3, 3, shorts(&[bits; 3])),
+            (259, 3, 1, shorts(&[1])),
+            (262, 3, 1, shorts(&[2])),
+            (277, 3, 1, shorts(&[3])),
+            (284, 3, 1, shorts(&[2])),
+            (322, 4, 1, longs(&[tw])),
+            (323, 4, 1, longs(&[th])),
+            (324, 4, offsets.len() as u32, longs(&offsets)),
+            (325, 4, counts.len() as u32, longs(&counts)),
+            (33550, 12, 3, doubles(&[30.0, 30.0, 0.0])),
+            (33922, 12, 6, doubles(&[0.0, 0.0, 0.0, -8_300_000.0, -925_000.0, 0.0])),
+            (34735, 3, 8, shorts(&[1, 1, 0, 1, 3072, 0, 1, 3857])),
+        ];
+        let ifd_at = out.len() + out.len() % 2;
+        out.resize(ifd_at, 0);
+        let values_at = ifd_at + 2 + 12 * e.len() + 4;
+        let mut values: Vec<u8> = Vec::new();
+        let mut dir = (e.len() as u16).to_le_bytes().to_vec();
+        for (tag, ty, count, bytes) in &mut e {
+            dir.extend(tag.to_le_bytes());
+            dir.extend(ty.to_le_bytes());
+            dir.extend(count.to_le_bytes());
+            if bytes.len() <= 4 {
+                bytes.resize(4, 0);
+                dir.extend(bytes.iter());
+            } else {
+                dir.extend(((values_at + values.len()) as u32).to_le_bytes());
+                values.extend(bytes.iter());
+            }
+        }
+        out[4..8].copy_from_slice(&(ifd_at as u32).to_le_bytes());
+        out.extend(dir);
+        out.extend([0; 4]);
+        out.extend(values);
+        out
+    }
+
+    #[test]
+    fn tiled_bands_stored_apart_are_read_whole() {
+        // Issue #544: a tiled GeoTIFF with its bands stored apart (GDAL's INTERLEAVE=BAND), read
+        // whole, panicked in the tiff crate on the padded bottom tiles of its later bands; read a
+        // tile at a time (as a large file is), those tiles' rows came out skewed.
+        let pixel = |b: u32, x: u32, y: u32| ((x + 3 * y + 60 * b) % 250 + 1) as u8;
+        // Padded right, bottom, both and neither; a tile wider than tall, padded both ways.
+        for (w, h, tile) in [(40, 24, (16, 16)), (32, 32, (16, 16)), (17, 9, (16, 16)), (24, 40, (16, 16)), (40, 20, (16, 8))] {
+            let bytes = planar_tiled(w, h, tile, 8, pixel);
+            // The whole image, and every 2nd pixel of it (a limit it doesn't fit).
+            for (k, max) in [(1, MAX_SAMPLES), (2, (w * h) as usize)] {
+                let r = read_limited(reader(std::io::Cursor::new(&bytes)).unwrap(), "planar", max, None).unwrap();
+                assert_eq!((r.width, r.height, r.band_count()), (w.div_ceil(k), h.div_ceil(k), 3));
+                for y in 0..r.height {
+                    for x in 0..r.width {
+                        for b in 0..3 {
+                            let want = f32::from(pixel(b, x * k, y * k));
+                            let at = (i64::from(x), i64::from(y));
+                            assert_eq!(r.value(b as usize, at.0, at.1), Some(want), "{w}×{h} (k {k}): band {b} at {x},{y}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn padded_planar_tiles_below_8_bits_are_refused() {
+        // They can't be read a tile at a time, and the decoder panics reading them whole.
+        let bytes = planar_tiled(40, 24, (16, 16), 4, |_, _, _| 0);
+        let e = read(std::io::Cursor::new(&bytes), "planar").unwrap_err();
+        assert!(e.to_string().contains("fewer than 8 bits"), "{e}");
+        // Padded only on the right, they're left to the decoder (these samples are bytes, not
+        // nibbles, so whatever it makes of them).
+        let bytes = planar_tiled(40, 32, (16, 16), 4, |_, _, _| 0);
+        let read = read(std::io::Cursor::new(&bytes), "planar");
+        assert!(read.as_ref().err().is_none_or(|e| !e.to_string().contains("fewer than 8 bits")), "{read:?}");
     }
 
     #[test]

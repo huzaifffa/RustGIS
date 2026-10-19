@@ -56,7 +56,7 @@ pub const NETWORK: &[&str] = &[
 pub fn commands() -> Vec<C> {
     vec![
         C::new("map.addTiles", "Add Tile Layer", "Home › Add", add).params(
-            r#"{"url": "https://…/{z}/{x}/{y}.png" | vector tiles ".pbf" or TileJSON | MapLibre style.json | a PMTiles archive (web address or file path) | an MBTiles file path, "kind"?: "raster"|"vector"|"style"|"pmtiles"|"mbtiles" (guessed from the url), "name"?: text, "attribution"?: text, "minZoom"?: number, "maxZoom"?: number, "tileSize"?: 256|512, "tms"?: bool, "subdomains"?: [text], "layers"?: [vector tile layer names, drawn in colours of their own], "styleLayers"?: [MapLibre style layers drawing vector tiles instead (their source is the tiles')], "opacity"?: 0–1, "blend"?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"difference" (how it combines with what is beneath), "overlay"?: bool (a transparent layer kept on top; one with the same address and role is replaced when it has the same name or the same look), "replace"?: bool (removes the other tile basemaps, not overlays), "id"?: catalog id, "view"?: bool (a MapLibre style: go to the place, zoom, bearing and pitch its root properties give, once it loads)}"#,
+            r#"{"url": "https://…/{z}/{x}/{y}.png" | vector tiles ".pbf" or TileJSON | MapLibre style.json | a PMTiles archive (web address or file path) | an MBTiles file path, "kind"?: "raster"|"vector"|"style"|"pmtiles"|"mbtiles" (guessed from the url), "name"?: text, "attribution"?: text, "minZoom"?: number, "maxZoom"?: number, "tileSize"?: 256|512, "tms"?: bool, "subdomains"?: [text], "layers"?: [vector tile layer names, drawn in colours of their own], "styleLayers"?: [MapLibre style layers drawing vector tiles instead (their source is the tiles')], "opacity"?: 0–1, "blend"?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"difference" (how it combines with what is beneath), "overlay"?: bool (a transparent layer kept on top; one with the same address and role is replaced when it has the same name or the same look), "replace"?: bool (removes the other tile basemaps, not overlays), "id"?: catalog id, "view"?: bool (a MapLibre style: go to the place, zoom, bearing and pitch its root properties give, once it loads), "start"?, "end"?: dates a url with date placeholders ({date:YYYY-MM-DD}, {YYYY}) spans, turning the time slider on (or, when it is on, setting its span), "unit"?, "interval"?, "dates"?: its steps (as in time.set)}"#,
         ),
         C::new("map.removeTiles", "Remove Tile Layer", "Home › Add", remove)
             .params(r#"{"name"?: text, "index"?: number, "id"?: catalog id} (removes every tile layer when none is given)"#),
@@ -64,6 +64,9 @@ pub fn commands() -> Vec<C> {
             r#"{"name"?: text | "index"?: number (0 = top) | "id"?: catalog id, "visible"?: bool, "opacity"?: 0–1, "blend"?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"difference", "move"?: "up"|"down"|"top"|"bottom", "rename"?: text, "bands"?: [red, green, blue] | [band] (a cloud-optimised GeoTIFF's bands shown, from 1; [] for its own), "range"?: [low, high] (the values shown from black to full colour; null: each band's 2nd–98th percentile), "dequantize"?: "aef" (AlphaEarth's quantised embeddings) | "none"}"#,
         ),
         C::new("map.tiles", "Tile Layers", "Home › Add", |s, _| Ok(list(s, false))).view(),
+        C::new("map.zoomToTiles", "Zoom To Tile Layer", "Home › Add", zoom_to)
+            .params(r#"{"name"?: text | "index"?: number (0 = top) | "id"?: catalog id} (a PMTiles archive or cloud-optimised GeoTIFF: the bounds its header gives)"#)
+            .view(),
         C::new("map.body", "Celestial Body", "Home › Add", body).params(
             r#"{"name"?: "earth"|"moon"|"mars"|"mercury"|"venus"|"io"|"europa"|"ganymede"|"callisto"|"titan"|"pluto"|"charon" (map.bodies lists them; default: the basemap's body), "basemap"?: a planetary basemap's id (default: the body's first; USGS Imagery on the Earth) | false (adds none, keeping the web basemaps but other bodies')}"#,
         ),
@@ -142,7 +145,22 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
         Some(k) => TileKind::from_code(k).ok_or_else(|| format!("unknown kind '{k}' (raster, vector, style, pmtiles or mbtiles)"))?,
         None => TileKind::guess(url),
     };
-    let mut t = TileLayer::new(ps(p, "name").unwrap_or_default(), kind, url);
+    // A dated address (`{date:YYYY-MM-DD}`) follows the time slider, which the layer's span
+    // (`start`, `end`) turns on when it is off.
+    let dated = rustgis_data::time::is_template(url);
+    if dated && !matches!(kind, TileKind::Raster | TileKind::Vector | TileKind::Cog) {
+        return Err(format!("{url}: dated addresses work for raster, vector and GeoTIFF tile layers, not {}", kind.code()));
+    }
+    let at = if dated { dated_start(s, p)? } else { 0.0 };
+    let mut t = TileLayer::new(
+        ps(p, "name").unwrap_or_default(),
+        kind,
+        if dated { rustgis_data::time::fill_template(url, at) } else { url.to_string() },
+    );
+    if dated {
+        t.time_url = Some(url.to_string());
+        t.time_at = at;
+    }
     if let Some(a) = ps(p, "attribution") {
         t.attribution = a.to_string();
     }
@@ -208,13 +226,83 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     }
     // Overlays go on top; basemaps go on top of the other basemaps, under the overlays.
     let at = if t.overlay { 0 } else { m.tiles.iter().position(|o| !o.overlay).unwrap_or(m.tiles.len()) };
-    let out = json!({"name": t.name, "kind": t.kind.code(), "index": at});
+    let mut out = json!({"name": t.name, "kind": t.kind.code(), "index": at});
+    if t.time_url.is_some() {
+        out["url"] = json!(t.url);
+        out["dated"] = json!(true);
+    }
+    let archive = t.kind == TileKind::PmTiles && t.id.is_empty();
     m.tiles.insert(at, t);
-    if view {
+    // A file's header is read now (natively), so a script's next command sees the map moved; a
+    // file slower than a second to answer (a network mount) is framed when it does, as a web
+    // address is, and one that can't be read says so when the layer draws.
+    #[cfg(not(target_arch = "wasm32"))]
+    if archive && rustgis_render::rustgis_tiles::pmtiles::is_local(&url) {
+        // Its error, if any, is the layer's to report when it draws.
+        let _ = rustgis_render::rustgis_tiles::pmtiles::info_blocking(&url, std::time::Duration::from_secs(1));
+    }
+    // A style goes to the view it gives, an archive to its bounds, once read (see
+    // follow_style_view); a catalog's archive leaves the map where it is.
+    if view || archive {
         s.style_view = Some((url, s.map().camera));
         follow_style_view(s, web_time::Duration::ZERO);
     }
     Ok(out)
+}
+
+/// What a tile layer covers, from its header (a PMTiles archive's or a cloud-optimised
+/// GeoTIFF's): `None` while it is still being read.
+fn extent_of(t: &TileLayer) -> Result<Option<rustgis_geom::Extent>, String> {
+    use rustgis_render::rustgis_tiles::pmtiles;
+    let bounds = match t.kind {
+        TileKind::PmTiles => pmtiles::info(&t.url)?.map(|i| i.bounds),
+        TileKind::Cog => cog::info(&t.url)?.map(|i| i.bounds),
+        _ => return Err(format!("{}: a {} doesn't say what it covers", t.name, t.kind.label().to_lowercase())),
+    };
+    let Some([w, so, e, n]) = bounds else { return Ok(None) };
+    let ok = [w, so, e, n].iter().all(|v| v.is_finite()) && w < e && so < n;
+    let e = rustgis_geom::Extent::new(w.max(-180.0), so.max(-85.06), e.min(180.0), n.min(85.06));
+    if !ok || e.is_empty() {
+        return Err(format!("{}: its header gives no bounds", t.name));
+    }
+    Ok(Some(e))
+}
+
+/// Whether an extent is (nearly) the whole world: a world archive added leaves the map where it is.
+fn whole_world(e: &rustgis_geom::Extent) -> bool {
+    e.width() >= 350.0 && e.height() >= 160.0
+}
+
+fn zoom_to(s: &mut Session, p: &Value) -> CmdResult {
+    let i = find(s, p)?.ok_or("give the tile layer's name or index")?;
+    let t = s.map().tiles.get(i).cloned().ok_or("no tile layer at that index")?;
+    let e = extent_of(&t)?.ok_or_else(|| format!("{}: still being read; try again in a moment", t.name))?;
+    s.zoom_to(&e);
+    Ok(json!({"bounds": [e.min_x, e.min_y, e.max_x, e.max_y]}))
+}
+
+/// The date a dated tile layer starts at: the time slider's step. Its `start` (and `end`,
+/// `unit`, `interval` or `dates`) set the slider up, turning it on when it is off. Should a later
+/// check of the layer fail, the session restores the project, the slider with it (tested).
+fn dated_start(s: &mut Session, p: &Value) -> Result<f64, String> {
+    let keys = ["start", "end", "unit", "interval", "dates"];
+    let mut given: serde_json::Map<String, Value> = keys.iter().filter_map(|k| p.get(*k).map(|v| (k.to_string(), v.clone()))).collect();
+    if given.is_empty() {
+        return s
+            .map()
+            .time
+            .as_ref()
+            .map(|t| t.current)
+            .ok_or_else(|| "this address has dates: give its start (and end), or turn the time slider on first".to_string());
+    }
+    // Steps by what the address changes by: a day for `{date:YYYY-MM-DD}`, a year for `{YYYY}`.
+    if !given.contains_key("unit")
+        && let Some(u) = ps(p, "url").and_then(rustgis_data::time::template_unit)
+    {
+        given.insert("unit".into(), json!(u.code()));
+    }
+    super::time::set(s, &Value::Object(given))?;
+    Ok(s.map().time.as_ref().map_or(0.0, |t| t.current))
 }
 
 /// The most passes made waiting for a style to load (each waits for the fetches under way).
@@ -230,12 +318,15 @@ pub(crate) fn follow_style_view(s: &mut Session, wait: web_time::Duration) -> bo
         s.style_view = None;
         return false;
     }
-    let Some(t) = s.map().tiles.iter().find(|t| t.kind == TileKind::Style && t.url == url).cloned() else {
+    let Some(t) = s.map().tiles.iter().find(|t| matches!(t.kind, TileKind::Style | TileKind::PmTiles) && t.url == url).cloned() else {
         // Removed, or another map is active: nothing to follow.
         s.style_view = None;
         return false;
     };
     let wait = if cfg!(target_arch = "wasm32") { web_time::Duration::ZERO } else { wait };
+    if t.kind == TileKind::PmTiles {
+        return follow_archive(s, &t, wait);
+    }
     let start = web_time::Instant::now();
     let mut passes = 0;
     let view = loop {
@@ -265,6 +356,33 @@ pub(crate) fn follow_style_view(s: &mut Session, wait: web_time::Duration) -> bo
             false
         }
     }
+}
+
+/// Frames the map on an archive added (see [`follow_style_view`]) once its header is read, unless
+/// it covers the whole world. Unreadable, it stays where it is: the layer says why when it draws.
+fn follow_archive(s: &mut Session, t: &TileLayer, wait: web_time::Duration) -> bool {
+    let start = web_time::Instant::now();
+    let mut passes = 0;
+    let e = loop {
+        match extent_of(t) {
+            Ok(Some(e)) => break e,
+            Ok(None) if passes < STYLE_WAITS && start.elapsed() < wait => {
+                rustgis_render::rustgis_tiles::cache::wait(wait.saturating_sub(start.elapsed()));
+                passes += 1;
+            }
+            Ok(None) => return false,
+            Err(_) => {
+                s.style_view = None;
+                return false;
+            }
+        }
+    };
+    s.style_view = None;
+    if whole_world(&e) {
+        return false;
+    }
+    s.zoom_to(&e);
+    true
 }
 
 /// The tile layer a command names by `index`, `name` or `id`.
@@ -381,6 +499,10 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
         t.name = r.chars().take(120).collect();
     }
     if let Some(url) = new_url {
+        // A dated layer keeps the look at every date: its template takes it too.
+        if let Some(template) = t.time_url.as_mut() {
+            *template = cog::with_look(template, &cog::split(&url).1);
+        }
         t.url = url;
     }
     if let Some(mv) = ps(p, "move") {

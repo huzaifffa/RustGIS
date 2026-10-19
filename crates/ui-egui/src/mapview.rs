@@ -35,6 +35,13 @@ enum DragKind {
     Sketch,
     /// Moving or inserting a vertex with the Edit Vertices tool.
     Vertex,
+    /// Moving the selected text graphic, grabbed by its text (#516): its layer id and row, and
+    /// where the press was. Held by the drag itself, so it ends with it, however it ends.
+    Text {
+        layer: u32,
+        row: usize,
+        origin: Pos2,
+    },
 }
 
 /// Graphic shapes drawn by dragging rather than clicking.
@@ -87,9 +94,10 @@ pub struct MapView {
     /// The map's controls, scale bar, sketches and pop-up are left out (a screen snapshot for the
     /// MCP relay that asked for the map alone).
     pub hide_overlays: bool,
-    /// How long the last frame drawn mid-motion took (ms), and the share of full resolution it
-    /// was drawn at: the next is spaced out by it, and drawn finer or coarser to take about 16 ms.
-    motion_cost: (f64, f64),
+    /// How long a frame of the view at full resolution takes to draw (ms), as the last one
+    /// measured it: frames drawn mid-motion are spaced out by it, and drawn coarser only when
+    /// full resolution would be too slow (see `motion_resolution`).
+    motion_cost: f64,
     labels: Vec<PlacedLabel>,
     /// On the globe, where each label stands on the Earth, so it follows the globe as it turns
     /// and zooms until the next frame places them again.
@@ -186,7 +194,7 @@ impl Default for MapView {
             tex_rect: Rect::NOTHING,
             view_rect: None,
             hide_overlays: false,
-            motion_cost: (0.0, 1.0),
+            motion_cost: 0.0,
             labels: Vec::new(),
             label_lonlat: Vec::new(),
             label_camera: Camera::world(),
@@ -312,6 +320,8 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         egui::Frame::NONE.inner_margin(egui::Margin::same(16)).show(ui, |ui| crate::workspacepanes::catalog_view(app, ui, &t));
         return;
     }
+    // A text selected on the map opens the Format pane (#516).
+    crate::graphicformat::follow(app, ui.ctx());
     animate(app, ui);
     // Side by side: the other map on the right, following this one when views are linked.
     if let Some(other) = split_map(app).filter(|i| *i != app.session.project.active_map) {
@@ -582,6 +592,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 && let Some(r) = done.rendered
             {
                 app.map.render_ms = done.ms;
+                app.map.motion_cost = full_cost(done.ms as f64, &done.view, (w, h), ppp);
                 match r {
                     rustgis_engine::render::RenderOutput::Cpu(r) => {
                         app.map.gpu_frame = None;
@@ -672,11 +683,12 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     }
     let stale = app.map.key != Some(key);
     // While the flat map moves on the CPU its last frame is shifted and scaled, until that no
-    // longer covers the view (zooming out, panning past its edge) or stretches it blurry
-    // (zooming in). Then a frame is drawn mid-motion: for a gap, over twice the width and height,
-    // so the next steps are covered too (as MapLibre keeps showing the tiles around the view);
-    // when stretched, at the view. Frames are drawn coarser while they're slow, and sharpening
-    // ones spaced out by how long the last took, so the motion between them stays smooth.
+    // longer covers the view (zooming out, panning past its edge) or stretches it noticeably
+    // (zooming in). Then a frame is drawn mid-motion: for a gap, over 1.5 times the width and
+    // height, so the next steps are covered too (as MapLibre keeps showing the tiles around the
+    // view); when stretched, at the view. They are drawn at full resolution, as QGIS draws its
+    // previews, unless that would take too long (see `motion_resolution`); sharpening ones are
+    // spaced out by how long they take, so the motion between them stays smooth.
     // Turning the map isn't a shift and a scale: each step is drawn.
     // Nor is moving a tilted map (its perspective changes).
     // The tilted map's drape stands in for both.
@@ -686,19 +698,18 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         .then(|| {
             let r = tex_rect(app, cam, rect, false);
             let stretch = r.width() as f64 / app.map.tex_size.0.max(1.0);
-            let (ms, k) = app.map.motion_cost;
-            let (vw, vh, most, least) = if !r.expand(0.5).contains_rect(rect) {
-                // A gap is filled at once: each such frame covers zooming out twice as far, so
-                // they can't come often.
-                (w * 2.0, h * 2.0, 0.5, 0.2)
-            } else if stretch > 1.3 && time - app.map.last_render >= motion_gap(ms) {
-                (w, h, 1.0, 0.4)
+            let full = app.map.motion_cost;
+            let (vw, vh, k) = if !r.expand(0.5).contains_rect(rect) {
+                // A gap is filled at once.
+                (w * GAP_SPAN, h * GAP_SPAN, motion_resolution(full, GAP_SPAN * GAP_SPAN))
             } else {
-                return None;
+                let k = motion_resolution(full, 1.0);
+                if stretch <= 1.1 || time - app.map.last_render < motion_gap(full * k * k) {
+                    return None;
+                }
+                (w, h, k)
             };
-            // Aim for a 60 Hz frame budget; start coarse until a measured draw cost is available.
-            let k = if ms > 0.0 { k * (16.0 / ms).sqrt().clamp(0.5, 1.4) } else { 0.65 };
-            Some((vw, vh, ppp * (k * most).clamp(least, most) as f32))
+            Some((vw, vh, ppp * k as f32))
         })
         .flatten();
     let (vw, vh, vppp) = motion.unwrap_or((w, h, render_ppp));
@@ -766,9 +777,9 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
         }
         app.map.render_ms = t0.elapsed().as_millis() as u64;
-        if let Some((_, _, p)) = motion {
-            let k = (p / ppp) as f64 / if vw > w { 0.5 } else { 1.0 };
-            app.map.motion_cost = (t0.elapsed().as_secs_f64() * 1000.0, k);
+        let view = View { width: vw, height: vh, pixels_per_point: vppp as f64, camera: cam, sky: true };
+        app.map.motion_cost = full_cost(t0.elapsed().as_secs_f64() * 1000.0, &view, (w, h), ppp);
+        if motion.is_some() {
             ui.ctx().request_repaint();
         } else if app.map.camera_moved {
             app.session.record_extent();
@@ -960,6 +971,32 @@ fn show_frame(
     app.map.key = Some(key);
 }
 
+/// How much wider and taller than the view a frame drawn mid-motion to fill a gap is, so the
+/// next steps of zooming out or panning are covered too.
+const GAP_SPAN: f64 = 1.5;
+
+/// How long (ms) a frame drawn mid-motion may take before it is drawn coarser: about two
+/// 60 Hz frames, so a pan or zoom that redraws stays smooth.
+const MOTION_BUDGET_MS: f64 = 32.0;
+
+/// The share of full resolution for a frame drawn mid-motion over `area` times the view, when
+/// one at full resolution over the view takes `full_ms` to draw: full resolution while that
+/// fits `MOTION_BUDGET_MS`, coarser (down to half) only for maps that draw slowly.
+fn motion_resolution(full_ms: f64, area: f64) -> f64 {
+    let cost = full_ms * area;
+    if cost.is_nan() || cost <= MOTION_BUDGET_MS {
+        return 1.0;
+    }
+    (MOTION_BUDGET_MS / cost).sqrt().clamp(0.5, 1.0)
+}
+
+/// What a frame drawn for `view` in `ms` would have cost at full resolution over the `w × h`
+/// map view: drawing grows with its pixels.
+fn full_cost(ms: f64, view: &View, (w, h): (f64, f64), ppp: f32) -> f64 {
+    let pixels = (view.width * view.height) / (w * h).max(1.0) * (view.pixels_per_point / f64::from(ppp).max(0.01)).powi(2);
+    ms / pixels.max(0.01)
+}
+
 /// The least time (s) between frames drawn mid-motion, for frames taking `ms` to draw: quick
 /// ones as often as 30 a second, slower ones further apart so the motion between them stays
 /// smooth.
@@ -1049,7 +1086,8 @@ pub(crate) fn lonlat_to_screen(app: &RustGisApp, rect: Rect, c: Coord) -> Option
 }
 
 /// The text graphic drawn on top under the screen point `p`, as (layer id, row): one whose text,
-/// with its dynamic values filled in as drawn, covers the point.
+/// with its dynamic values filled in as drawn, covers the point. A layer that isn't selectable
+/// (`layer.selectable`) is passed over: its texts can't be picked, so can't be edited either.
 pub(crate) fn text_graphic_at(app: &RustGisApp, ctx: &egui::Context, rect: Rect, p: Pos2) -> Option<(u32, usize)> {
     use rustgis_engine::map::graphics;
     let (map, scale) = (app.session.map(), app.session.scale());
@@ -1057,7 +1095,7 @@ pub(crate) fn text_graphic_at(app: &RustGisApp, ctx: &egui::Context, rect: Rect,
     // Only what is drawn, as render_frame draws it: the first layer on top, and in a layer the
     // last row. Fully transparent layers and rows beyond the view clipping distance are not drawn.
     let clip = map.view.clip_distance.map(|d| (map.camera.center_lonlat(), d));
-    map.layers.iter().filter(|l| l.graphics && map.draws_at(l, scale) && map.layer_opacity(l) > 0.0).find_map(|l| {
+    map.layers.iter().filter(|l| l.graphics && l.selectable && map.draws_at(l, scale) && map.layer_opacity(l) > 0.0).find_map(|l| {
         let drawn = l.drawn_rows(scale);
         (0..l.dataset.features.len()).rev().filter(|r| drawn.get(*r) == Some(&true)).find_map(|row| {
             let g = l.dataset.features.get(row)?.geometry.as_ref()?;
@@ -1068,13 +1106,28 @@ pub(crate) fn text_graphic_at(app: &RustGisApp, ctx: &egui::Context, rect: Rect,
                     return None;
                 }
             }
-            let text = graphics::expand(graphics::label(&l.dataset, row)?, &tokens);
-            let at = lonlat_to_screen(app, rect, g.label_point()?)?;
-            let font = regular(graphics::font_size(&l.dataset, row) * 1.33);
+            let (at, text, font) = text_shown(app, rect, &tokens, l, row)?;
             let size = ctx.fonts_mut(|f| f.layout_no_wrap(text, font, Color32::WHITE).size());
             Rect::from_center_size(at, size).expand(3.0).contains(p).then_some((l.id, row))
         })
     })
+}
+
+/// A text graphic as the map shows it: the screen point it is centred on, its text with the
+/// dynamic values filled in, and the font it is measured with.
+fn text_shown(
+    app: &RustGisApp,
+    rect: Rect,
+    tokens: &rustgis_engine::map::graphics::TokenValues,
+    l: &rustgis_engine::map::Layer,
+    row: usize,
+) -> Option<(Pos2, String, egui::FontId)> {
+    use rustgis_engine::map::graphics;
+    let text = graphics::expand(graphics::label(&l.dataset, row)?, tokens);
+    let at = lonlat_to_screen(app, rect, l.dataset.features.get(row)?.geometry.as_ref()?.label_point()?)?;
+    let size = graphics::font_size(&l.dataset, row) * 1.33;
+    let font = if graphics::bold(&l.dataset, row) { crate::theme::semibold(size) } else { regular(size) };
+    Some((at, text, font))
 }
 
 /// Centres the map on a place as it moves along (a simulated drive), keeping the zoom; the map
@@ -1260,7 +1313,14 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         && let Some(p) = resp.interact_pointer_pos()
     {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(p);
-        let kind = if middle {
+        // The selected text, grabbed by its text, moves (#516); any other drag is as before.
+        let grabbed = (matches!(tool, Tool::Explore | Tool::Select) && !middle && !shift && !ctrl)
+            .then(|| text_graphic_at(app, ui.ctx(), rect, origin))
+            .flatten()
+            .filter(|hit| crate::graphicformat::selected(app) == Some(*hit));
+        let kind = if let Some((layer, row)) = grabbed {
+            DragKind::Text { layer, row, origin }
+        } else if middle {
             DragKind::Pan
         } else if tool == Tool::EditVertices && crate::vertexedit::drag_start(app, rect, origin) {
             DragKind::Vertex
@@ -1299,6 +1359,30 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         } else {
             app.map.sketch.truncate(1);
             app.map.sketch.push(c);
+        }
+    }
+    // A dragged text shows where it will land; it is placed there, as one undo step, on release.
+    if let Some((_, DragKind::Text { layer, row, origin })) = app.map.drag {
+        let end = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos()));
+        let map = app.session.map();
+        let tokens = rustgis_engine::map::graphics::TokenValues::of(map, app.session.scale());
+        let shown = map.layer(layer).and_then(|l| text_shown(app, rect, &tokens, l, row));
+        if resp.drag_stopped() {
+            app.map.drag = None;
+            let to = shown.zip(end).and_then(|((at, ..), end)| screen_to_lonlat(app, rect, at + (end - origin)));
+            if let Some(c) = to {
+                let _ = app.run("graphics.edit", json!({"layer": layer, "row": row, "points": [[c.x, c.y]]}));
+            }
+            return;
+        }
+        if let (Some((at, text, font)), Some(end)) = (shown, end) {
+            let t = Tokens::get(ui.ctx());
+            let painter =
+                ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.id().with("text_drag"))).with_clip_rect(rect);
+            let r = painter.text(at + (end - origin), egui::Align2::CENTER_CENTER, text, font, t.accent);
+            painter.rect_stroke(r.expand(3.0), 2.0, egui::Stroke::new(1.0, t.accent), egui::StrokeKind::Outside);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            ui.ctx().request_repaint();
         }
     }
     if let (Some((_, DragKind::Vertex)), Some(p)) = (app.map.drag, resp.interact_pointer_pos()) {
@@ -1405,12 +1489,12 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         } else if tool == Tool::EditVertices {
             // Its two clicks chose a vertex or a feature; zooming would lose the place.
         } else if let Some(p) = resp.interact_pointer_pos() {
-            // A double-click on a text graphic edits it; elsewhere it zooms in.
+            // A double-click on a text graphic edits it in the Format pane; elsewhere it zooms in.
             if matches!(tool, Tool::Explore | Tool::Select)
                 && let Some((layer, row)) = text_graphic_at(app, ui.ctx(), rect, p)
             {
                 app.map.popup = None;
-                let _ = app.run("ui.dialog", json!({"name": "graphicText", "layer": layer, "row": row}));
+                let _ = crate::graphicformat::edit(app, layer, row);
                 return;
             }
             zoom(app, 2.0, (p.x - rect.min.x) as f64, (p.y - rect.min.y) as f64, w, h);
@@ -1456,6 +1540,21 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             let _ = app.run("edit.split", json!({"lon": c.x, "lat": c.y}));
             return;
         }
+        // A click anywhere on a text graphic's text selects it, not only on its anchor; on the
+        // one already selected, it brings back the Format pane closed over it (#516). Shift and
+        // Ctrl (Cmd) clicks add to or take from the selection as usual.
+        if matches!(tool, Tool::Explore | Tool::Select)
+            && !ui.input(|i| i.modifiers.shift || i.modifiers.command)
+            && let Some((layer, row)) = text_graphic_at(app, ui.ctx(), rect, p)
+        {
+            app.map.popup = None;
+            if crate::graphicformat::selected(app) == Some((layer, row)) {
+                app.ui.open_right(crate::RightPane::Format);
+            } else {
+                let _ = app.run("select.rows", json!({"layer": layer, "rows": [row]}));
+            }
+            return;
+        }
         // Sketch vertices snap to features when snapping is on.
         let c = if tool.creates() || matches!(tool, Tool::Graphic(_) | Tool::Measure | Tool::MeasureArea) { snapped(app, c) } else { c };
         match tool {
@@ -1496,12 +1595,12 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
                 let _ = app.run("edit.addFeature", with_template(app, json!({"geometry": {"type": "Point", "coordinates": [c.x, c.y]}})));
             }
             Tool::Graphic("point") => finish_graphic(app, "point", vec![c]),
+            // Placed, selected and open in the Format pane, as a layout's text (#516).
             Tool::Graphic("text") => {
-                let mut params = json!({"name": "graphicText", "lon": c.x, "lat": c.y});
-                if let Some(t) = app.ui.dynamic_text {
-                    params["text"] = json!(t);
+                let text = app.ui.dynamic_text;
+                if let Err(e) = crate::graphicformat::place(app, c.x, c.y, text) {
+                    app.session.notify(e, true);
                 }
-                let _ = app.run("ui.dialog", params);
             }
             // Dragged shapes ignore plain clicks.
             Tool::Graphic(s) if !vertex_shape(Tool::Graphic(s)) => {}
@@ -2606,6 +2705,25 @@ mod tests {
         assert!(h.state().map.labels.is_empty(), "the preview kept labels from the old visibility state");
     }
 
+    /// Frames drawn mid-motion stay at full resolution unless the map draws slowly, and even
+    /// then are never drawn below half resolution (a blurry map while panning and zooming).
+    #[test]
+    fn motion_frames_stay_sharp_unless_slow() {
+        assert_eq!(motion_resolution(0.0, 1.0), 1.0, "unmeasured cost");
+        assert_eq!(motion_resolution(12.0, 1.0), 1.0, "a quick map");
+        assert_eq!(motion_resolution(12.0, GAP_SPAN * GAP_SPAN), 1.0, "a quick map's gap frame");
+        let slow = motion_resolution(64.0, 1.0);
+        assert!((0.5..1.0).contains(&slow), "a slow map draws coarser: {slow}");
+        assert_eq!(motion_resolution(10_000.0, 4.0), 0.5, "never below half");
+        assert_eq!(motion_resolution(f64::NAN, 1.0), 1.0);
+        assert_eq!(motion_resolution(f64::INFINITY, 1.0), 0.5);
+        // A gap frame over 1.5 times the view at full resolution costs 2.25 views.
+        let gap = View { width: 1200.0, height: 900.0, pixels_per_point: 2.0, camera: Camera::world(), sky: true };
+        assert!((full_cost(45.0, &gap, (800.0, 600.0), 2.0) - 20.0).abs() < 1e-9);
+        let coarse = View { pixels_per_point: 1.0, ..gap };
+        assert!((full_cost(45.0, &coarse, (800.0, 600.0), 2.0) - 80.0).abs() < 1e-9);
+    }
+
     /// The GPU fast path moves the last frame's meshes only while they cover the view: zooming
     /// out or panning past the cull margin re-renders, or features culled from the last frame
     /// would vanish until the motion stopped.
@@ -2689,6 +2807,11 @@ mod tests {
         app.run("map.clipping", json!({"distance": 1_000_000.0})).unwrap();
         assert_eq!(probe(&app), None, "beyond the clipping distance");
         app.run("map.clipping", json!({"mode": "none"})).unwrap();
+        assert_eq!(probe(&app), hit);
+        // Nor text on a layer that isn't selectable.
+        app.run("layer.selectable", json!({"layer": layer, "on": false})).unwrap();
+        assert_eq!(probe(&app), None, "not selectable");
+        app.run("layer.selectable", json!({"layer": layer, "on": true})).unwrap();
         assert_eq!(probe(&app), hit);
         app.run("group.set", json!({"group": "Notes", "transparency": 100})).unwrap();
         assert_eq!(probe(&app), None, "on a fully transparent layer");
