@@ -7707,8 +7707,10 @@ fn layout_shapes_are_added_restyled_and_saved() {
     let partial = add(&mut s, json!({"kind": "rectangle", "x": 30, "y": 40, "h": 10}));
     let e = s.project.layouts[li].element(partial).unwrap();
     assert_eq!((e.name.as_str(), e.x, e.y, e.h), ("Rectangle", 30.0, 40.0, 10.0));
-    let neat = add(&mut s, json!({"kind": "rectangle"}));
-    assert_eq!(s.project.layouts[li].element(neat).unwrap().name, "Neatline");
+    for p in [json!({"kind": "rectangle"}), json!({"kind": "rectangle", "x": null, "w": null})] {
+        let neat = add(&mut s, p);
+        assert_eq!(s.project.layouts[li].element(neat).unwrap().name, "Neatline");
+    }
     // Saved and read back.
     let back: rustgis_map::layout::Layout = serde_json::from_value(serde_json::to_value(&s.project.layouts[li]).unwrap()).unwrap();
     assert_eq!(back, s.project.layouts[li]);

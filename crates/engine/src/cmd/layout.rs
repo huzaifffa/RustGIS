@@ -340,7 +340,6 @@ fn duplicate_element(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"element": copy, "name": name}))
 }
 
-/// The element's box: given values, else a default inside the page.
 /// A shape's "width" in points: `default` when it's not given (or null), an error when it's not a
 /// number.
 fn shape_width(p: &Value, default: f64) -> Result<f64, String> {
@@ -362,6 +361,7 @@ fn line_dir(p: &Value, default: LineDir) -> Result<LineDir, String> {
     }
 }
 
+/// The element's box: given values, else a default inside the page.
 fn place(p: &Value, l: &Layout, (dx, dy, dw, dh): (f64, f64, f64, f64)) -> Result<(f64, f64, f64, f64), String> {
     let v = |k: &str, d: f64| f(p, k).unwrap_or(d);
     let (x, y, w, h) = (v("x", dx), v("y", dy), v("w", dw.min(l.width - 10.0).max(5.0)), v("h", dh.min(l.height - 10.0).max(5.0)));
@@ -544,7 +544,7 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
                 width: shape_width(p, 1.0)?.clamp(0.0, 50.0),
             };
             // Without a box it frames the page, as a neatline does; with any part of one it's a shape.
-            if ["x", "y", "w", "h"].iter().any(|k| p.get(k).is_some()) {
+            if ["x", "y", "w", "h"].iter().any(|k| p.get(k).is_some_and(|v| !v.is_null())) {
                 ("Rectangle", place(p, l, (pw * 0.4, ph * 0.4, pw * 0.2, ph * 0.2))?, k)
             } else {
                 ("Neatline", place(p, l, (5.0, 5.0, pw - 10.0, ph - 10.0))?, k)
