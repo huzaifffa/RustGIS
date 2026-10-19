@@ -87,6 +87,9 @@ pub struct LayoutView {
     /// removed), the frame, the factor on its scale, the page point (mm) kept under the pointer,
     /// and when the wheel last turned (seconds).
     frame_zoom: Option<(String, u32, f64, (f64, f64), f64)>,
+    /// Where the primary button last went down: egui forgets it on release, and a click is
+    /// judged by where it started.
+    pressed: Option<Pos2>,
 }
 
 /// Forgets the selection and the text typed into its fields once another project has replaced
@@ -140,9 +143,12 @@ const HANDLE_PICK: f32 = 11.0;
 
 /// The selected element's resize handle at a screen point: the element and the handle (0..8
 /// clockwise from top-left), the nearest within reach. On a small element the reach shrinks, so
-/// its middle still moves it.
-fn handle_at(lv: &LayoutView, layout: &Layout, page: Rect, s: f32, pos: Pos2) -> Option<(u32, usize)> {
-    let e = lv.selected.and_then(|id| layout.element(id))?;
+/// its middle still moves it. Navigating, a map frame under the pointer pans instead: no handle.
+fn handle_at(app: &RustGisApp, layout: &Layout, page: Rect, s: f32, pos: Pos2) -> Option<(u32, usize)> {
+    if nav_frame(app, layout, page, s, pos).is_some() {
+        return None;
+    }
+    let e = app.layout.selected.and_then(|id| layout.element(id))?;
     let r = Rect::from_min_max(to_screen(page, s, (e.x, e.y)), to_screen(page, s, (e.x + e.w, e.y + e.h)));
     let reach = HANDLE_PICK.min((r.width().min(r.height()) / 3.0).max(5.0));
     handles(r)
@@ -549,7 +555,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         // The handle under the pointer, or being dragged, is filled.
         let active = match app.layout.drag {
             Some(Drag::Resize(id, h, _)) if id == e.id => Some(h),
-            None => pointer.and_then(|p| handle_at(&app.layout, &layout, page, s, p)).map(|(_, h)| h),
+            None => pointer.and_then(|p| handle_at(app, &layout, page, s, p)).map(|(_, h)| h),
             _ => None,
         };
         for (i, h) in handles(r).into_iter().enumerate() {
@@ -727,6 +733,9 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
         }
         return;
     }
+    if let Some(o) = ui.input(|i| i.pointer.press_origin()) {
+        app.layout.pressed = Some(o);
+    }
     // Rulers and guides show they can be dragged.
     if let Some(p) = resp.hover_pos() {
         let vertical = match app.layout.drag {
@@ -737,7 +746,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
         let navigating = app.layout.drag.is_none() && nav_frame(app, layout, page, s, p).is_some();
         let handle = match app.layout.drag {
             Some(Drag::Resize(_, h, _)) => Some(h),
-            None if !navigating => handle_at(&app.layout, layout, page, s, p).map(|(_, h)| h),
+            None if !navigating => handle_at(app, layout, page, s, p).map(|(_, h)| h),
             _ => None,
         };
         match (vertical, handle) {
@@ -758,12 +767,15 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
         }
     }
     // A click on a ruler, or on the selected element's handle (which can stick out over another
-    // element), keeps the selection.
+    // element), keeps the selection: where the click started, as the pointer may have moved a
+    // little by the release.
     if resp.clicked()
         && let Some(p) = pointer_mm
-        && resp
-            .interact_pointer_pos()
-            .is_none_or(|pos| ruler_at(&app.layout, resp.rect, pos).is_none() && handle_at(&app.layout, layout, page, s, pos).is_none())
+        && app
+            .layout
+            .pressed
+            .or(resp.interact_pointer_pos())
+            .is_none_or(|pos| ruler_at(&app.layout, resp.rect, pos).is_none() && handle_at(app, layout, page, s, pos).is_none())
     {
         app.layout.selected = layout.hit(p.0, p.1);
         // A click on the element already selected brings back the pane closed over it.
@@ -788,7 +800,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
         let p = to_mm(page, s, origin);
         // Navigating, a map frame pans as Shift-dragging one does; its handles stay put.
         let shift = ui.input(|i| i.modifiers.shift) || app.layout.navigate;
-        let handle = handle_at(&app.layout, layout, page, s, origin).filter(|_| nav_frame(app, layout, page, s, origin).is_none());
+        let handle = handle_at(app, layout, page, s, origin);
         let ruler = ruler_at(&app.layout, resp.rect, origin);
         let guide = guide_at(layout, page, s, origin);
         app.layout.drag = Some(match (ruler, handle, guide, layout.hit(p.0, p.1)) {
@@ -1534,6 +1546,51 @@ mod tests {
         );
         let (dw, dh) = ((e.w - title.w) * s as f64, (e.h - title.h) * s as f64);
         assert!((59.0..=61.0).contains(&dw) && (29.0..=31.0).contains(&dh), "grew by {dw} × {dh} points, not 60 × 30");
+    }
+
+    /// A click that starts on the selected element's handle keeps the selection, though the
+    /// pointer moved off the handle (and off the element) before the release.
+    #[test]
+    fn a_click_started_on_a_handle_keeps_the_selection() {
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Click"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().clone();
+        app.layout.selected = Some(title.id);
+        let area = Rc::new(Cell::new(Rect::NOTHING));
+        let shown = area.clone();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                shown.set(ui.available_rect_before_wrap());
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let layout = h.state().session.project.layouts[li].clone();
+        let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+        // Pressed at the edge of the bottom-right handle's reach, released a few points further
+        // out: still a click, but on nothing.
+        let corner = to_screen(page, s, (title.x + title.w, title.y + title.h));
+        let (from, to) = (corner + vec2(8.0, 8.0), corner + vec2(12.0, 12.0));
+        let button = |pos: Pos2, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.event(Event::PointerMoved(from));
+        h.step();
+        h.event(button(from, true));
+        h.step();
+        h.event(Event::PointerMoved(to));
+        h.step();
+        h.event(button(to, false));
+        h.run_steps(2);
+        let (x, y) = super::to_mm(page, s, to);
+        assert!(layout.hit(x, y).is_none(), "the release is off every element");
+        assert_eq!(h.state().layout.selected, Some(title.id));
     }
 
     /// Dragging an element redraws the page with it where it was dropped (#325).
