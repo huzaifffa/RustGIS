@@ -134,6 +134,36 @@ fn to_screen(page: Rect, s: f32, (x, y): (f64, f64)) -> Pos2 {
     pos2(page.min.x + x as f32 * s, page.min.y + y as f32 * s)
 }
 
+/// A resize handle's drawn size, and how near (points) the pointer picks one up.
+const HANDLE: f32 = 10.0;
+const HANDLE_PICK: f32 = 11.0;
+
+/// The selected element's resize handle at a screen point: the element and the handle (0..8
+/// clockwise from top-left), the nearest within reach. On a small element the reach shrinks, so
+/// its middle still moves it.
+fn handle_at(lv: &LayoutView, layout: &Layout, page: Rect, s: f32, pos: Pos2) -> Option<(u32, usize)> {
+    let e = lv.selected.and_then(|id| layout.element(id))?;
+    let r = Rect::from_min_max(to_screen(page, s, (e.x, e.y)), to_screen(page, s, (e.x + e.w, e.y + e.h)));
+    let reach = HANDLE_PICK.min((r.width().min(r.height()) / 3.0).max(5.0));
+    handles(r)
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (i, (h.x - pos.x).abs().max((h.y - pos.y).abs())))
+        .filter(|(_, d)| *d <= reach)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| (e.id, i))
+}
+
+/// The cursor for dragging handle `h`.
+fn handle_cursor(h: usize) -> CursorIcon {
+    match h {
+        0 | 4 => CursorIcon::ResizeNwSe,
+        2 | 6 => CursorIcon::ResizeNeSw,
+        1 | 5 => CursorIcon::ResizeVertical,
+        _ => CursorIcon::ResizeHorizontal,
+    }
+}
+
 fn handles(r: Rect) -> [Pos2; 8] {
     let (c, m) = (r.center(), r);
     [
@@ -516,9 +546,16 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             5.0,
             3.0,
         ));
-        for h in handles(r) {
-            painter.rect_filled(Rect::from_center_size(h, vec2(7.0, 7.0)), 1.0, Color32::WHITE);
-            painter.rect_stroke(Rect::from_center_size(h, vec2(7.0, 7.0)), 1.0, Stroke::new(1.2, accent), egui::StrokeKind::Middle);
+        // The handle under the pointer, or being dragged, is filled.
+        let active = match app.layout.drag {
+            Some(Drag::Resize(id, h, _)) if id == e.id => Some(h),
+            None => pointer.and_then(|p| handle_at(&app.layout, &layout, page, s, p)).map(|(_, h)| h),
+            _ => None,
+        };
+        for (i, h) in handles(r).into_iter().enumerate() {
+            let hr = Rect::from_center_size(h, vec2(HANDLE, HANDLE));
+            painter.rect_filled(hr, 2.0, if active == Some(i) { accent } else { Color32::WHITE });
+            painter.rect_stroke(hr, 2.0, Stroke::new(1.5, accent), egui::StrokeKind::Middle);
         }
         painter.text(r.left_top() + vec2(0.0, -4.0), Align2::LEFT_BOTTOM, &e.name, regular(11.0), accent);
     }
@@ -697,17 +734,36 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
             Some(_) => None,
             None => ruler_at(&app.layout, resp.rect, p).or_else(|| guide_at(layout, page, s, p).map(|g| g.0)),
         };
-        match vertical {
-            Some(true) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
-            Some(false) => ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical),
-            None if matches!(app.layout.drag, Some(Drag::PanFrame(..))) => ui.ctx().set_cursor_icon(CursorIcon::Grabbing),
-            None if app.layout.drag.is_none() && nav_frame(app, layout, page, s, p).is_some() => ui.ctx().set_cursor_icon(CursorIcon::Grab),
-            None => {}
+        let navigating = app.layout.drag.is_none() && nav_frame(app, layout, page, s, p).is_some();
+        let handle = match app.layout.drag {
+            Some(Drag::Resize(_, h, _)) => Some(h),
+            None if !navigating => handle_at(&app.layout, layout, page, s, p).map(|(_, h)| h),
+            _ => None,
+        };
+        match (vertical, handle) {
+            (_, Some(h)) => ui.ctx().set_cursor_icon(handle_cursor(h)),
+            (Some(true), _) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
+            (Some(false), _) => ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical),
+            _ if matches!(app.layout.drag, Some(Drag::PanFrame(..))) => ui.ctx().set_cursor_icon(CursorIcon::Grabbing),
+            _ if navigating => ui.ctx().set_cursor_icon(CursorIcon::Grab),
+            _ if matches!(app.layout.drag, Some(Drag::Move(..))) => ui.ctx().set_cursor_icon(CursorIcon::Move),
+            _ if app.layout.drag.is_none() && app.layout.tool.is_none() && {
+                let (x, y) = to_mm(page, s, p);
+                layout.hit(x, y).is_some()
+            } =>
+            {
+                ui.ctx().set_cursor_icon(CursorIcon::Move)
+            }
+            _ => {}
         }
     }
+    // A click on a ruler, or on the selected element's handle (which can stick out over another
+    // element), keeps the selection.
     if resp.clicked()
         && let Some(p) = pointer_mm
-        && resp.interact_pointer_pos().is_none_or(|pos| ruler_at(&app.layout, resp.rect, pos).is_none())
+        && resp
+            .interact_pointer_pos()
+            .is_none_or(|pos| ruler_at(&app.layout, resp.rect, pos).is_none() && handle_at(&app.layout, layout, page, s, pos).is_none())
     {
         app.layout.selected = layout.hit(p.0, p.1);
         // A click on the element already selected brings back the pane closed over it.
@@ -723,17 +779,16 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
         let _ = app.run("layout.frameZoom", json!({"layout": li, "element": id, "to": "view"}));
     }
     if resp.drag_started()
-        && let (Some(p), Some(pos)) = (pointer_mm, resp.interact_pointer_pos())
+        && let Some(pos) = resp.interact_pointer_pos()
     {
+        // What was pressed decides the drag, and the drag runs from where it was pressed: egui
+        // starts one only once the pointer has moved, by then often off a small handle (which
+        // then moved the element instead of resizing it).
+        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+        let p = to_mm(page, s, origin);
         // Navigating, a map frame pans as Shift-dragging one does; its handles stay put.
         let shift = ui.input(|i| i.modifiers.shift) || app.layout.navigate;
-        let sel = app.layout.selected.and_then(|id| layout.element(id)).filter(|_| nav_frame(app, layout, page, s, pos).is_none());
-        let handle = sel.and_then(|e| {
-            let r = Rect::from_min_max(to_screen(page, s, (e.x, e.y)), to_screen(page, s, (e.x + e.w, e.y + e.h)));
-            handles(r).iter().position(|h| (*h - pos).length() < 7.0).map(|h| (e.id, h))
-        });
-        // Where the press was: a drag starts only once the pointer has moved off it.
-        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+        let handle = handle_at(&app.layout, layout, page, s, origin).filter(|_| nav_frame(app, layout, page, s, origin).is_none());
         let ruler = ruler_at(&app.layout, resp.rect, origin);
         let guide = guide_at(layout, page, s, origin);
         app.layout.drag = Some(match (ruler, handle, guide, layout.hit(p.0, p.1)) {
@@ -1408,6 +1463,62 @@ mod tests {
     use serde_json::json;
     use std::{cell::Cell, rc::Rc};
 
+    /// Pressing a corner handle and dragging away fast resizes the element, though by the time
+    /// egui starts the drag the pointer is already off the handle; it used to move the element.
+    #[test]
+    fn a_fast_drag_from_a_corner_handle_resizes() {
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Resize"})).unwrap();
+        app.layout.no_snap = true;
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().clone();
+        app.layout.selected = Some(title.id);
+        let area = Rc::new(Cell::new(Rect::NOTHING));
+        let shown = area.clone();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                shown.set(ui.available_rect_before_wrap());
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let layout = h.state().session.project.layouts[li].clone();
+        let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+        // A little inside the bottom-right handle, not on its centre: no bull's-eye needed.
+        let corner = to_screen(page, s, (title.x + title.w, title.y + title.h)) + vec2(-4.0, -3.0);
+        let to = corner + vec2(60.0, 30.0);
+        let button = |pos: Pos2, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.event(Event::PointerMoved(corner));
+        h.step();
+        h.event(button(corner, true));
+        h.step();
+        // Three big steps: the first already leaves the handle behind.
+        for i in 1..=3 {
+            h.event(Event::PointerMoved(corner + (to - corner) * i as f32 / 3.0));
+            h.step();
+        }
+        h.event(button(to, false));
+        h.step();
+        let app = h.state();
+        let (_, s) = app.layout.drag_page.unwrap();
+        let e = app.session.project.layouts[li].element(title.id).unwrap();
+        assert!(
+            (e.x - title.x).abs() < 0.01 && (e.y - title.y).abs() < 0.01,
+            "the top-left stays: {:?} → {:?}",
+            (title.x, title.y),
+            (e.x, e.y)
+        );
+        let (dw, dh) = ((e.w - title.w) * s as f64, (e.h - title.h) * s as f64);
+        assert!((59.0..=61.0).contains(&dw) && (29.0..=31.0).contains(&dh), "grew by {dw} × {dh} points, not 60 × 30");
+    }
+
     /// Dragging an element redraws the page with it where it was dropped (#325).
     #[test]
     fn dropped_element_is_drawn_where_it_lands() {
@@ -1457,9 +1568,9 @@ mod tests {
         // properties opened beside the page and re-fitted it mid-drag.
         let (_, s) = app.layout.drag_page.unwrap();
         assert!((moved.x - title.x).abs() < 0.01, "x moved from {} to {}", title.x, moved.x);
-        // The drag starts once the pointer has moved, a step into the 120 points.
+        // The drag runs from where the button went down, so the element moved with the pointer.
         let dy = (moved.y - title.y) * s as f64;
-        assert!((90.0..=120.5).contains(&dy), "y moved {dy} points");
+        assert!((119.0..=120.5).contains(&dy), "y moved {dy} points");
         // The page was drawn, and keyed, from the layout as it is after the drop.
         let (i, rev, drawn) = app.layout.shown.as_ref().unwrap();
         assert_eq!((*i, *rev), (li, app.session.revision));
