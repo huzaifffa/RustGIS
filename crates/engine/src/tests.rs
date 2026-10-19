@@ -7681,15 +7681,34 @@ fn layout_shapes_are_added_restyled_and_saved() {
         k => panic!("{k:?}"),
     }
     // Bad values change nothing.
-    for bad in [json!({"kind": "line", "dir": "sideways"}), json!({"kind": "circle", "fill": "red"})] {
+    for bad in [
+        json!({"kind": "line", "dir": "sideways"}),
+        json!({"kind": "line", "dir": 3}),
+        json!({"kind": "line", "width": "thick"}),
+        json!({"kind": "circle", "fill": "red"}),
+        json!({"kind": "ellipse", "width": true}),
+    ] {
         assert!(s.run("layout.addElement", &bad).is_err(), "{bad}");
     }
-    for bad in
-        [json!({"element": line, "dir": "up"}), json!({"element": circle, "width": "thick"}), json!({"element": rect, "outline": "#XYZ"})]
-    {
+    for bad in [
+        json!({"element": line, "dir": "up"}),
+        json!({"element": line, "dir": 1}),
+        json!({"element": circle, "width": "thick"}),
+        json!({"element": rect, "outline": "#XYZ"}),
+    ] {
         assert!(s.run("layout.update", &bad).is_err(), "{bad}");
     }
     assert!(matches!(s.project.layouts[li].element(line).unwrap().kind, ElementKind::Line { dir: LineDir::Rising, .. }));
+    // A null width or direction is left as it is.
+    s.run("layout.update", &json!({"element": line, "width": null, "dir": null})).unwrap();
+    assert!(matches!(s.project.layouts[li].element(line).unwrap().kind,
+        ElementKind::Line { dir: LineDir::Rising, width, .. } if width == 3.0));
+    // Any part of a box makes a rectangle a shape, not the page's neatline.
+    let partial = add(&mut s, json!({"kind": "rectangle", "x": 30, "y": 40, "h": 10}));
+    let e = s.project.layouts[li].element(partial).unwrap();
+    assert_eq!((e.name.as_str(), e.x, e.y, e.h), ("Rectangle", 30.0, 40.0, 10.0));
+    let neat = add(&mut s, json!({"kind": "rectangle"}));
+    assert_eq!(s.project.layouts[li].element(neat).unwrap().name, "Neatline");
     // Saved and read back.
     let back: rustgis_map::layout::Layout = serde_json::from_value(serde_json::to_value(&s.project.layouts[li]).unwrap()).unwrap();
     assert_eq!(back, s.project.layouts[li]);
