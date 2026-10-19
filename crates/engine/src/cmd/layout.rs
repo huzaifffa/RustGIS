@@ -6,9 +6,9 @@ use std::path::Path;
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::Rgba;
 use rustgis_map::layout::{
-    ArrowStyle, CoordFormat, ElementKind, FrameShape, Grid, GridEdges, GridStyle, Guides, Layout, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH,
-    MAX_GUIDES, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries, Orientation, PAGES, ScaleBarStyle, ScaleUnits, TextAlign,
-    TickSide, fit_scale,
+    ArrowStyle, CoordFormat, ElementKind, FrameShape, Grid, GridEdges, GridStyle, Guides, Layout, LineDir, MAX_COLORBAR_TICKS,
+    MAX_GRID_WIDTH, MAX_GUIDES, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries, Orientation, PAGES, ScaleBarStyle, ScaleUnits,
+    TextAlign, TickSide, fit_scale,
 };
 use serde_json::{Value, json};
 
@@ -82,10 +82,10 @@ pub fn commands() -> Vec<C> {
             r#"{"layout"?, "shape"?: "rectangle"|"circle"|"ellipse"|"polygon"|"lasso", "points"?: [[u, v], …] (polygon/lasso, 0..1 across the frame), "map"?: name, "x"?, "y"?, "w"?, "h"?: mm}"#,
         ),
         C::new("layout.addElement", "Add Element", "Publish › Map Surrounds", add_element).params(
-            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA", "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, northArrow), "width"?: outline width (rectangle) or line width in points (grid), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees (0 picks one), "labels"?: bool, "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar), "x"?, "y"?, "w"?, "h"?: mm}"##,
+            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle"|"ellipse"|"circle"|"line"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA", "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees (0 picks one), "labels"?: bool, "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar), "x"?, "y"?, "w"?, "h"?: mm}"##,
         ),
         C::new("layout.update", "Element Properties", "Publish › Element", update).params(
-            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "text"?, "size"?, "color"?, "bold"?, "italic"?, "align"?, "letterSpacing"? (text), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?}"##,
+            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "text"?, "size"?, "color"?, "bold"?, "italic"?, "align"?, "letterSpacing"? (text), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse), "color"? (text, line; the outline of a rectangle or ellipse), "width"?: points (rectangle, ellipse, line), "dir"? (line), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?}"##,
         ),
         C::new("layout.guides", "Guides", "Publish › Page Setup", guides).params(
             r#"{"layout"?, "x"?: [mm] (vertical guides, from the page's left edge), "y"?: [mm] (horizontal guides, from its top edge), "clear"?: bool (remove every guide first)}"#,
@@ -522,7 +522,44 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
                 outline: color(p, "color", Rgba::rgb(0x22, 0x22, 0x22))?,
                 width: f(p, "width").unwrap_or(1.0).clamp(0.0, 50.0),
             };
-            ("Neatline", place(p, l, (5.0, 5.0, pw - 10.0, ph - 10.0))?, k)
+            // Without a box it frames the page, as a neatline does; with one it's a shape.
+            if f(p, "w").is_some() {
+                ("Rectangle", place(p, l, (pw * 0.4, ph * 0.4, pw * 0.2, ph * 0.2))?, k)
+            } else {
+                ("Neatline", place(p, l, (5.0, 5.0, pw - 10.0, ph - 10.0))?, k)
+            }
+        }
+        "ellipse" | "circle" => {
+            let k = ElementKind::Ellipse {
+                fill: color(p, "fill", Rgba::new(0, 0, 0, 0))?,
+                outline: color(p, "color", Rgba::rgb(0x22, 0x22, 0x22))?,
+                width: f(p, "width").unwrap_or(1.0).clamp(0.0, 50.0),
+            };
+            // A circle is an ellipse in a square box.
+            let d = (pw.min(ph) * 0.25).max(5.0);
+            let (w, h) = if kind == "circle" { (d, d) } else { (d * 1.5, d) };
+            let name = if kind == "circle" { "Circle" } else { "Ellipse" };
+            (name, place(p, l, ((pw - w) / 2.0, (ph - h) / 2.0, w, h))?, k)
+        }
+        "line" => {
+            let dir = match ps(p, "dir") {
+                Some(v) => LineDir::from_name(v)
+                    .ok_or_else(|| format!("unknown line direction '{v}' (horizontal, vertical, falling or rising)"))?,
+                None => LineDir::Horizontal,
+            };
+            let k = ElementKind::Line {
+                color: color(p, "color", Rgba::rgb(0x22, 0x22, 0x22))?,
+                width: f(p, "width").unwrap_or(1.0).clamp(0.1, 50.0),
+                dir,
+            };
+            // The box is the line's, with room either side to pick it up by.
+            let len = (pw.min(ph) * 0.4).max(10.0);
+            let (w, h) = match dir {
+                LineDir::Horizontal => (len, 6.0),
+                LineDir::Vertical => (6.0, len),
+                LineDir::Falling | LineDir::Rising => (len, len * 0.6),
+            };
+            ("Line", place(p, l, ((pw - w) / 2.0, (ph - h) / 2.0, w, h))?, k)
         }
         "extentIndicator" => {
             let frame = frame_of(l, p)?;
@@ -766,6 +803,36 @@ fn restyle(kind: &ElementKind, p: &Value) -> Result<Option<ElementKind>, String>
                 None => *divisions,
             };
             Ok(Some(ElementKind::ScaleBar { frame: *frame, units, divisions, style }))
+        }
+        ElementKind::Rectangle { fill, outline, width } | ElementKind::Ellipse { fill, outline, width } => {
+            if ["fill", "outline", "color", "width"].iter().all(|k| p.get(k).is_none()) {
+                return Ok(None);
+            }
+            // The outline's colour is "outline", or "color" as when adding one.
+            let (fill, outline) = (color(p, "fill", *fill)?, color(p, "outline", color(p, "color", *outline)?)?);
+            let width = match p.get("width") {
+                Some(_) => f(p, "width").ok_or("width is a number of points")?.clamp(0.0, 50.0),
+                None => *width,
+            };
+            Ok(Some(match kind {
+                ElementKind::Ellipse { .. } => ElementKind::Ellipse { fill, outline, width },
+                _ => ElementKind::Rectangle { fill, outline, width },
+            }))
+        }
+        ElementKind::Line { color: c, width, dir } => {
+            if ["color", "width", "dir"].iter().all(|k| p.get(k).is_none()) {
+                return Ok(None);
+            }
+            let dir = match ps(p, "dir") {
+                Some(v) => LineDir::from_name(v)
+                    .ok_or_else(|| format!("unknown line direction '{v}' (horizontal, vertical, falling or rising)"))?,
+                None => *dir,
+            };
+            let width = match p.get("width") {
+                Some(_) => f(p, "width").ok_or("width is a number of points")?.clamp(0.1, 50.0),
+                None => *width,
+            };
+            Ok(Some(ElementKind::Line { color: color(p, "color", *c)?, width, dir }))
         }
         _ => Ok(None),
     }

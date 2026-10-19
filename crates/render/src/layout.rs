@@ -221,6 +221,25 @@ pub fn render(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> O
                     );
                 }
             }
+            ElementKind::Ellipse { fill, outline, width } => {
+                if let Some(p) = PathBuilder::from_oval(r) {
+                    pm.fill_path(&p, &paint(*fill, 1.0), FillRule::Winding, Transform::identity(), None);
+                    if *width > 0.0 {
+                        let stroke = Stroke { width: (*width as f32) * ppp as f32, ..Stroke::default() };
+                        pm.stroke_path(&p, &paint(*outline, 1.0), &stroke, Transform::identity(), None);
+                    }
+                }
+            }
+            ElementKind::Line { color, width, dir } => {
+                let [(x0, y0), (x1, y1)] = dir.ends((r.x().into(), r.y().into(), r.width().into(), r.height().into()));
+                let mut pb = PathBuilder::new();
+                pb.move_to(x0 as f32, y0 as f32);
+                pb.line_to(x1 as f32, y1 as f32);
+                if let Some(p) = pb.finish() {
+                    let stroke = Stroke { width: ((*width as f32) * ppp as f32).max(0.5), ..Stroke::default() };
+                    pm.stroke_path(&p, &paint(*color, 1.0), &stroke, Transform::identity(), None);
+                }
+            }
         }
     }
     Some(pm)
@@ -1505,6 +1524,25 @@ mod tests {
         let x = pm.width() / 2;
         let inked = (0..pm.height()).filter(|&y| pm.pixel(x, y).is_some_and(|p| p.red() < 250)).count();
         assert!((1..=3).contains(&inked), "{inked} rows inked");
+    }
+
+    #[test]
+    fn ellipses_and_lines_draw_inside_their_boxes() {
+        use rustgis_map::layout::LineDir;
+        // 100 × 50 mm at 254 dpi: ten pixels a millimetre.
+        let mut l = Layout::new("Layout", 100.0, 50.0);
+        let red = Rgba::rgb(255, 0, 0);
+        l.add("Circle", (10.0, 10.0, 30.0, 30.0), ElementKind::Ellipse { fill: red, outline: red, width: 0.0 });
+        l.add("Line", (50.0, 10.0, 40.0, 30.0), ElementKind::Line { color: Rgba::rgb(0, 0, 255), width: 2.0, dir: LineDir::Rising });
+        let pm = render(&l, &mut [], 254.0, &PageInfo::default()).unwrap();
+        let is = |x: u32, y: u32, want: (u8, u8, u8)| pm.pixel(x, y).is_some_and(|p| (p.red(), p.green(), p.blue()) == want);
+        let (white, red, blue) = ((255, 255, 255), (255, 0, 0), (0, 0, 255));
+        // The circle's middle is filled; its box's corner, outside the circle, isn't.
+        assert!(is(250, 250, red), "circle centre");
+        assert!(is(110, 110, white), "outside the circle, in its box's corner");
+        // The rising line runs from the box's bottom-left to its top-right, through the middle.
+        assert!(is(700, 250, blue), "the line's middle");
+        assert!(is(550, 150, white) && is(850, 350, white), "the other diagonal stays blank");
     }
 
     /// A 100 × 100 mm page with one map frame filling 10–90 mm, showing the world at 1:200M with

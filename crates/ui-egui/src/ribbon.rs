@@ -2774,6 +2774,31 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
             });
         });
     });
+    group(ui, "Shapes", |ui| {
+        // In the middle of the page, ready to be moved and sized.
+        let (pw, ph) = (layout.width, layout.height);
+        let (w, h) = (pw * 0.25, ph * 0.2);
+        let desc = "Add a rectangle, to frame or highlight part of the page.";
+        if big(ui, app, "g_rect", "Rectangle", desc, "ui.menu", Value::Null, false, false).clicked() {
+            add(app, json!({"kind": "rectangle", "x": (pw - w) / 2.0, "y": (ph - h) / 2.0, "w": w, "h": h}));
+        }
+        col(ui, |ui| {
+            if small(ui, app, "g_circle", "Circle", "Add a circle.", "ui.menu", Value::Null, false).clicked() {
+                add(app, json!({"kind": "circle"}));
+            }
+            if small(ui, app, "g_ellipse", "Ellipse", "Add an ellipse.", "ui.menu", Value::Null, false).clicked() {
+                add(app, json!({"kind": "ellipse"}));
+            }
+            small_menu(ui, app, "g_line", "Line", "Add a straight line.", |ui, app| {
+                for d in rustgis_engine::map::layout::LineDir::ALL {
+                    if ui.button(tl!(d.label())).clicked() {
+                        add(app, json!({"kind": "line", "dir": d.code()}));
+                        ui.close();
+                    }
+                }
+            });
+        });
+    });
     group(ui, "Text", |ui| {
         if big(ui, app, "g_text", "Text", "Add a text element.", "ui.menu", Value::Null, false, false).clicked() {
             add(app, json!({"kind": "text"}));

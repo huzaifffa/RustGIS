@@ -7643,6 +7643,58 @@ fn layout_elements_duplicate_offset_on_top_and_undo() {
 }
 
 #[test]
+fn layout_shapes_are_added_restyled_and_saved() {
+    use rustgis_map::layout::{ElementKind, LineDir};
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Shapes", "template": "blank"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let add = |s: &mut Session, p: Value| s.run("layout.addElement", &p).unwrap()["element"].as_u64().unwrap() as u32;
+    let rect = add(&mut s, json!({"kind": "rectangle", "x": 20, "y": 20, "w": 60, "h": 30}));
+    let circle = add(&mut s, json!({"kind": "circle"}));
+    let ellipse = add(&mut s, json!({"kind": "ellipse", "fill": "#FF000080"}));
+    let line = add(&mut s, json!({"kind": "line", "dir": "vertical", "width": 3}));
+    let l = &s.project.layouts[li];
+    let e = |id: u32| l.element(id).unwrap();
+    // A rectangle given a box is a shape; without one it's still the page's neatline.
+    assert_eq!((e(rect).name.as_str(), e(rect).x, e(rect).w), ("Rectangle", 20.0, 60.0));
+    assert!(matches!(e(rect).kind, ElementKind::Rectangle { .. }));
+    assert_eq!(e(circle).name, "Circle");
+    assert_eq!(e(circle).w, e(circle).h, "a circle's box is square");
+    assert!(e(ellipse).w > e(ellipse).h);
+    assert!(matches!(e(ellipse).kind, ElementKind::Ellipse { fill, .. } if fill.a() == 0x80));
+    assert!(matches!(e(line).kind, ElementKind::Line { dir: LineDir::Vertical, width, .. } if width == 3.0));
+    assert!(e(line).h > e(line).w, "a vertical line's box is tall");
+
+    // Restyled through layout.update; the outline is "outline" or "color".
+    s.run("layout.update", &json!({"element": circle, "fill": "#00FF00", "color": "#0000FF", "width": 0})).unwrap();
+    s.run("layout.update", &json!({"element": line, "dir": "rising", "color": "#123456"})).unwrap();
+    let l = &s.project.layouts[li];
+    match &l.element(circle).unwrap().kind {
+        ElementKind::Ellipse { fill, outline, width } => {
+            assert_eq!((fill.hex(), outline.hex(), *width), ("#00FF00".into(), "#0000FF".into(), 0.0))
+        }
+        k => panic!("{k:?}"),
+    }
+    match &l.element(line).unwrap().kind {
+        ElementKind::Line { color, width, dir } => assert_eq!((color.hex(), *width, *dir), ("#123456".into(), 3.0, LineDir::Rising)),
+        k => panic!("{k:?}"),
+    }
+    // Bad values change nothing.
+    for bad in [json!({"kind": "line", "dir": "sideways"}), json!({"kind": "circle", "fill": "red"})] {
+        assert!(s.run("layout.addElement", &bad).is_err(), "{bad}");
+    }
+    for bad in
+        [json!({"element": line, "dir": "up"}), json!({"element": circle, "width": "thick"}), json!({"element": rect, "outline": "#XYZ"})]
+    {
+        assert!(s.run("layout.update", &bad).is_err(), "{bad}");
+    }
+    assert!(matches!(s.project.layouts[li].element(line).unwrap().kind, ElementKind::Line { dir: LineDir::Rising, .. }));
+    // Saved and read back.
+    let back: rustgis_map::layout::Layout = serde_json::from_value(serde_json::to_value(&s.project.layouts[li]).unwrap()).unwrap();
+    assert_eq!(back, s.project.layouts[li]);
+}
+
+#[test]
 fn layout_guides_are_set_kept_and_undone() {
     let mut s = world();
     s.run("layout.new", &json!({"name": "G"})).unwrap();

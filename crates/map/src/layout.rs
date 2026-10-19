@@ -320,6 +320,56 @@ fn is_left(a: &TextAlign) -> bool {
 /// The most layers a legend leaves out.
 pub const MAX_LEGEND_EXCLUDED: usize = 1000;
 
+/// Which way a line element runs across its box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineDir {
+    /// Across the middle of the box, left to right.
+    #[default]
+    Horizontal,
+    /// Down the middle of the box.
+    Vertical,
+    /// From the top-left corner to the bottom-right.
+    Falling,
+    /// From the bottom-left corner to the top-right.
+    Rising,
+}
+
+impl LineDir {
+    pub const ALL: [LineDir; 4] = [LineDir::Horizontal, LineDir::Vertical, LineDir::Falling, LineDir::Rising];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            LineDir::Horizontal => "horizontal",
+            LineDir::Vertical => "vertical",
+            LineDir::Falling => "falling",
+            LineDir::Rising => "rising",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LineDir::Horizontal => "Horizontal",
+            LineDir::Vertical => "Vertical",
+            LineDir::Falling => "Diagonal ↘",
+            LineDir::Rising => "Diagonal ↗",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<LineDir> {
+        LineDir::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// The line's ends in a box (x, y, w, h).
+    pub fn ends(self, (x, y, w, h): (f64, f64, f64, f64)) -> [(f64, f64); 2] {
+        match self {
+            LineDir::Horizontal => [(x, y + h / 2.0), (x + w, y + h / 2.0)],
+            LineDir::Vertical => [(x + w / 2.0, y), (x + w / 2.0, y + h)],
+            LineDir::Falling => [(x, y), (x + w, y + h)],
+            LineDir::Rising => [(x, y + h), (x + w, y)],
+        }
+    }
+}
+
 /// A north arrow's look.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArrowStyle {
@@ -631,8 +681,18 @@ pub enum ElementKind {
         #[serde(default)]
         label: Option<String>,
     },
-    /// A rectangle drawn on the page (a neatline or a backdrop).
+    /// A rectangle drawn on the page (a neatline or a backdrop). `width` is the outline's, in
+    /// points (0: none).
     Rectangle { fill: Rgba, outline: Rgba, width: f64 },
+    /// An ellipse filling the element's box: a circle in a square one.
+    Ellipse { fill: Rgba, outline: Rgba, width: f64 },
+    /// A straight line across the element's box, `width` points wide.
+    Line {
+        color: Rgba,
+        width: f64,
+        #[serde(default)]
+        dir: LineDir,
+    },
 }
 
 fn rows() -> usize {
@@ -667,6 +727,8 @@ impl ElementKind {
             ElementKind::Table { .. } => "table",
             ElementKind::Chart { .. } => "chart",
             ElementKind::Rectangle { .. } => "rectangle",
+            ElementKind::Ellipse { .. } => "ellipse",
+            ElementKind::Line { .. } => "line",
         }
     }
     pub fn label(&self) -> &'static str {
@@ -681,6 +743,8 @@ impl ElementKind {
             ElementKind::Table { .. } => "Table Frame",
             ElementKind::Chart { .. } => "Chart Frame",
             ElementKind::Rectangle { .. } => "Rectangle",
+            ElementKind::Ellipse { .. } => "Ellipse",
+            ElementKind::Line { .. } => "Line",
         }
     }
     /// The map frame this element belongs to.
@@ -887,7 +951,10 @@ impl Layout {
                 }
                 ElementKind::Table { rows, .. } => *rows = (*rows).clamp(1, 500),
                 ElementKind::ScaleBar { divisions, .. } => *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS),
-                ElementKind::Rectangle { width, .. } => *width = finite_or(*width, 1.0).clamp(0.0, 50.0),
+                ElementKind::Rectangle { width, .. } | ElementKind::Ellipse { width, .. } => {
+                    *width = finite_or(*width, 1.0).clamp(0.0, 50.0)
+                }
+                ElementKind::Line { width, .. } => *width = finite_or(*width, 1.0).clamp(0.1, 50.0),
                 _ => {}
             }
         }

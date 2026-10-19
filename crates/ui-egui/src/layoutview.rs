@@ -6,7 +6,7 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    ArrowStyle, CoordFormat, ElementKind, Grid, GridStyle, Layout, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_LETTER_SPACING,
+    ArrowStyle, CoordFormat, ElementKind, Grid, GridStyle, Layout, LineDir, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_LETTER_SPACING,
     MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_LETTER_SPACING, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TextAlign, TickSide,
     frame_camera,
 };
@@ -1238,6 +1238,48 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                 if (r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged())) && n as usize != *rows {
                     update(app, json!({"rows": n}));
                 }
+                ui.end_row();
+            }
+            ElementKind::Rectangle { fill, outline, width } | ElementKind::Ellipse { fill, outline, width } => {
+                // A fill with no opacity leaves only the outline; an outline 0 wide, only the fill.
+                for (label, key, current) in [("Fill", "fill", *fill), ("Outline", "outline", *outline)] {
+                    ui.label(tl!(label));
+                    let mut c = crate::theme::c32(current);
+                    if crate::widgets::color_button(ui, &mut c).changed() {
+                        update(app, json!({key: crate::theme::rgba(c).hex()}));
+                    }
+                    ui.end_row();
+                }
+                ui.label(tl!("Outline width"));
+                let mut wd = *width;
+                let r = ui.add(egui::DragValue::new(&mut wd).range(0.0..=50.0).speed(0.1).max_decimals(1).suffix(" pt"));
+                if (r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged())) && (wd - width).abs() > 1e-6 {
+                    update(app, json!({"width": wd}));
+                }
+                ui.end_row();
+            }
+            ElementKind::Line { color, width, dir } => {
+                ui.label(tl!("Color"));
+                let mut c = crate::theme::c32(*color);
+                if crate::widgets::color_button(ui, &mut c).changed() {
+                    update(app, json!({"color": crate::theme::rgba(c).hex()}));
+                }
+                ui.end_row();
+                ui.label(tl!("Width"));
+                let mut wd = *width;
+                let r = ui.add(egui::DragValue::new(&mut wd).range(0.1..=50.0).speed(0.1).max_decimals(1).suffix(" pt"));
+                if (r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged())) && (wd - width).abs() > 1e-6 {
+                    update(app, json!({"width": wd}));
+                }
+                ui.end_row();
+                ui.label(tl!("Direction"));
+                egui::ComboBox::from_id_salt(("line_dir", id)).selected_text(tl!(dir.label())).show_ui(ui, |ui| {
+                    for d in LineDir::ALL {
+                        if ui.selectable_label(d == *dir, tl!(d.label())).clicked() {
+                            update(app, json!({"dir": d.code()}));
+                        }
+                    }
+                });
                 ui.end_row();
             }
             _ => {}
