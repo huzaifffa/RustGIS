@@ -65,6 +65,12 @@ the maps; while one is open, its groups lead the Publish tab:
   renamed or removed (it is kept by name, like a table or chart frame's layer) until another is
   picked. From a command:
   `layout.addElement={"kind":"colorbar","layer":"DEM","title":"Elevation (m)","orientation":"vertical","ticks":3}`.
+- **Shapes**: **Rectangle**, **Circle**, **Ellipse** and **Line** (horizontal, vertical or
+  either diagonal) add a shape in the middle of the page, to frame, highlight or divide parts of
+  it. A circle is an ellipse in a square box. The properties set a shape's fill, outline and
+  outline width (0 for none; a fill with no opacity leaves only the outline), and a line's colour,
+  width and direction. From a command:
+  `layout.addElement={"kind":"line","dir":"falling","color":"#C0392B","width":2}`.
 - **Text** and **Dynamic Text**: `{date}`, `{time}`, `{scale}`, `{map}`, `{crs}`, `{page}`,
   `{pages}`, `{pageName}` and `{layout}` fill in when the page is drawn; the Format pane's
   **Insert Dynamic Text** menu, under the text, lists each with what it shows. The text, its size (2 to 400 points, as text graphics on the
