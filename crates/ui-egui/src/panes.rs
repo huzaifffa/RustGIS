@@ -159,7 +159,7 @@ fn right_pane(app: &mut RustGisApp, ui: &mut Ui, right: RightPane, t: &Tokens) {
             RightPane::Shares => crate::docpanes::shares(app, ui, t),
             RightPane::Directions => crate::navui::show(app, ui, t),
             RightPane::Bookmarks => crate::bookmarkpane::show(app, ui, t),
-            RightPane::Format => crate::layoutview::format(app, ui, t),
+            RightPane::Format => crate::graphicformat::show(app, ui, t),
             RightPane::Plugin => crate::pluginpanel::show(app, ui, t),
             RightPane::WebData => web_data(app, ui),
         });
@@ -1693,6 +1693,20 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
     } else {
         if ui.button(tl!("Definition Query…")).clicked() {
             let _ = app.run("ui.dialog", json!({"name": "definitionQuery"}));
+            ui.close();
+        }
+        if l.time.is_some() {
+            if ui.button(tl!("Unbind From Time Slider")).clicked() {
+                let _ = app.run("time.unbind", json!({"layer": l.id}));
+                ui.close();
+            }
+        } else if ui
+            .add_enabled(!rustgis_engine::map::time::time_fields(&l.dataset).is_empty(), egui::Button::new(tl!("Bind To Time Slider")))
+            .on_disabled_hover_text(tl!("No field of this layer holds dates."))
+            .clicked()
+        {
+            app.time.hidden = false;
+            let _ = app.run("time.bind", json!({"layer": l.id}));
             ui.close();
         }
         if ui.button(tl!("Export Features…")).clicked() {

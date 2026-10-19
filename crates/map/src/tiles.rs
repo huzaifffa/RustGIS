@@ -135,6 +135,23 @@ pub struct TileLayer {
     /// the tiles' own. Empty for the default look.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub style_layers: String,
+    /// A URL with date placeholders (`{date:YYYY-MM-DD}`), filled from the time slider into
+    /// `url` at each step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_url: Option<String>,
+    /// The date `url` was last filled with.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub time_at: f64,
+}
+
+/// Whether an address is on the web (`http://` or `https://`, in any case).
+pub fn is_web(url: &str) -> bool {
+    let scheme = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    scheme.starts_with("https://") || scheme.starts_with("http://")
+}
+
+fn is_zero(x: &f64) -> bool {
+    *x == 0.0
 }
 
 /// The longest `style_layers` kept (JSON text).
@@ -195,6 +212,8 @@ impl TileLayer {
             id: String::new(),
             layers: Vec::new(),
             style_layers: String::new(),
+            time_url: None,
+            time_at: 0.0,
         }
     }
 
@@ -202,6 +221,10 @@ impl TileLayer {
     /// file or a command.
     pub fn repair(&mut self) -> Result<(), String> {
         self.url = self.url.trim().to_string();
+        // A dated address is a web address whose date is filled in after the scheme and host.
+        if self.time_url.as_ref().is_some_and(|u| !is_web(u) || u.len() > 4096) {
+            self.time_url = None;
+        }
         let local = matches!(self.kind, TileKind::PmTiles | TileKind::MbTiles) && is_local_archive(&self.url);
         if let Some(name) = self.url.strip_prefix(UPLOAD).filter(|_| self.kind == TileKind::MbTiles) {
             if name.is_empty() || name.len() > 512 || name.chars().any(char::is_control) {

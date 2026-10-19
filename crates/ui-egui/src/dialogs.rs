@@ -16,8 +16,6 @@ pub struct Dialogs {
     pub a: String,
     pub b: String,
     pub c: String,
-    /// Add/Edit Text's font size, in points: a number, so it can't be mistyped (#457).
-    pub size: f64,
     pub mode: &'static str,
     pub flag: bool,
     pub error: Option<String>,
@@ -57,7 +55,6 @@ impl Dialogs {
             "renameServiceGroup" => "renameServiceGroup",
             "renameGroup" => "renameGroup",
             "coordinateSystem" => "coordinateSystem",
-            "graphicText" => "graphicText",
             "camera" => "camera",
             "addTiles" => "addTiles",
             "addCsv" => "addCsv",
@@ -102,10 +99,6 @@ impl Dialogs {
                 self.b = format!("{:.5}", c.y);
                 self.c = format!("{:.0}", s.scale());
             }
-            "graphicText" => {
-                self.text = "Text".into();
-                self.size = 14.0;
-            }
             "addField" => self.b = "Double".into(),
             "calculateField" => self.a = active.and_then(|l| l.dataset.fields.last()).map(|f| f.name.clone()).unwrap_or_default(),
             "definitionQuery" => self.text = active.and_then(|l| l.definition_query.clone()).unwrap_or_default(),
@@ -136,8 +129,6 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "calculateField" => "Calculate Field",
         "definitionQuery" => "Definition Query",
         "coordinateSystem" => "Coordinate System",
-        "graphicText" if app.dialogs.mode == "edit" => "Edit Text",
-        "graphicText" => "Add Text",
         "camera" => "Camera",
         "addTiles" => "Add Tile Layer",
         "addCsv" => "Add Delimited Text",
@@ -229,27 +220,6 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     };
                     let (lon, lat, scale) = (n(&app.dialogs.a, "Longitude")?, n(&app.dialogs.b, "Latitude")?, n(&app.dialogs.c, "Scale")?);
                     app.run("map.camera", json!({"lon": lon, "lat": lat, "scale": scale})).map(|_| ())
-                });
-            }
-            "graphicText" => {
-                // The form a layout's text has too (#516); colour and boldness aren't kept by text
-                // graphics yet. What it settles is saved by the dialog's button.
-                let d = &mut app.dialogs;
-                let fields = crate::textform::Fields { text: &mut d.text, size: &mut d.size, color: None, bold: None };
-                crate::textform::show(ui, "graphic_text", &[rustgis_engine::map::graphics::TOKENS], fields, |_| {});
-                // Editing a placed text: `a` and `b` hold its layer id and row.
-                let editing = app.dialogs.mode == "edit";
-                close = buttons(app, ui, if editing { "Save" } else { "Add" }, |app| {
-                    if editing {
-                        let (layer, row) = (app.dialogs.a.parse::<u64>().unwrap_or(u64::MAX), app.dialogs.b.parse::<u64>().unwrap_or(u64::MAX));
-                        return app.run("graphics.edit", json!({"layer": layer, "row": row, "text": app.dialogs.text, "fontSize": app.dialogs.size})).map(|_| ());
-                    }
-                    let (lon, lat) = (app.dialogs.a.parse::<f64>().unwrap_or(f64::NAN), app.dialogs.b.parse::<f64>().unwrap_or(f64::NAN));
-                    let r = app.run("graphics.add", json!({"shape": "text", "points": [[lon, lat]], "text": app.dialogs.text, "fontSize": app.dialogs.size}));
-                    if r.is_ok() && !app.session.keep_tool {
-                        app.session.tool = rustgis_engine::Tool::Explore;
-                    }
-                    r.map(|_| ())
                 });
             }
             "bookmark" => {

@@ -56,7 +56,7 @@ pub const NETWORK: &[&str] = &[
 pub fn commands() -> Vec<C> {
     vec![
         C::new("map.addTiles", "Add Tile Layer", "Home › Add", add).params(
-            r#"{"url": "https://…/{z}/{x}/{y}.png" | vector tiles ".pbf" or TileJSON | MapLibre style.json | a PMTiles archive (web address or file path) | an MBTiles file path, "kind"?: "raster"|"vector"|"style"|"pmtiles"|"mbtiles" (guessed from the url), "name"?: text, "attribution"?: text, "minZoom"?: number, "maxZoom"?: number, "tileSize"?: 256|512, "tms"?: bool, "subdomains"?: [text], "layers"?: [vector tile layer names, drawn in colours of their own], "styleLayers"?: [MapLibre style layers drawing vector tiles instead (their source is the tiles')], "opacity"?: 0–1, "blend"?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"difference" (how it combines with what is beneath), "overlay"?: bool (a transparent layer kept on top; one with the same address and role is replaced when it has the same name or the same look), "replace"?: bool (removes the other tile basemaps, not overlays), "id"?: catalog id, "view"?: bool (a MapLibre style: go to the place, zoom, bearing and pitch its root properties give, once it loads)}"#,
+            r#"{"url": "https://…/{z}/{x}/{y}.png" | vector tiles ".pbf" or TileJSON | MapLibre style.json | a PMTiles archive (web address or file path) | an MBTiles file path, "kind"?: "raster"|"vector"|"style"|"pmtiles"|"mbtiles" (guessed from the url), "name"?: text, "attribution"?: text, "minZoom"?: number, "maxZoom"?: number, "tileSize"?: 256|512, "tms"?: bool, "subdomains"?: [text], "layers"?: [vector tile layer names, drawn in colours of their own], "styleLayers"?: [MapLibre style layers drawing vector tiles instead (their source is the tiles')], "opacity"?: 0–1, "blend"?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"difference" (how it combines with what is beneath), "overlay"?: bool (a transparent layer kept on top; one with the same address and role is replaced when it has the same name or the same look), "replace"?: bool (removes the other tile basemaps, not overlays), "id"?: catalog id, "view"?: bool (a MapLibre style: go to the place, zoom, bearing and pitch its root properties give, once it loads), "start"?, "end"?: dates a url with date placeholders ({date:YYYY-MM-DD}, {YYYY}) spans, turning the time slider on (or, when it is on, setting its span), "unit"?, "interval"?, "dates"?: its steps (as in time.set)}"#,
         ),
         C::new("map.removeTiles", "Remove Tile Layer", "Home › Add", remove)
             .params(r#"{"name"?: text, "index"?: number, "id"?: catalog id} (removes every tile layer when none is given)"#),
@@ -142,7 +142,22 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
         Some(k) => TileKind::from_code(k).ok_or_else(|| format!("unknown kind '{k}' (raster, vector, style, pmtiles or mbtiles)"))?,
         None => TileKind::guess(url),
     };
-    let mut t = TileLayer::new(ps(p, "name").unwrap_or_default(), kind, url);
+    // A dated address (`{date:YYYY-MM-DD}`) follows the time slider, which the layer's span
+    // (`start`, `end`) turns on when it is off.
+    let dated = rustgis_data::time::is_template(url);
+    if dated && !matches!(kind, TileKind::Raster | TileKind::Vector | TileKind::Cog) {
+        return Err(format!("{url}: dated addresses work for raster, vector and GeoTIFF tile layers, not {}", kind.code()));
+    }
+    let at = if dated { dated_start(s, p)? } else { 0.0 };
+    let mut t = TileLayer::new(
+        ps(p, "name").unwrap_or_default(),
+        kind,
+        if dated { rustgis_data::time::fill_template(url, at) } else { url.to_string() },
+    );
+    if dated {
+        t.time_url = Some(url.to_string());
+        t.time_at = at;
+    }
     if let Some(a) = ps(p, "attribution") {
         t.attribution = a.to_string();
     }
@@ -208,13 +223,41 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     }
     // Overlays go on top; basemaps go on top of the other basemaps, under the overlays.
     let at = if t.overlay { 0 } else { m.tiles.iter().position(|o| !o.overlay).unwrap_or(m.tiles.len()) };
-    let out = json!({"name": t.name, "kind": t.kind.code(), "index": at});
+    let mut out = json!({"name": t.name, "kind": t.kind.code(), "index": at});
+    if t.time_url.is_some() {
+        out["url"] = json!(t.url);
+        out["dated"] = json!(true);
+    }
     m.tiles.insert(at, t);
     if view {
         s.style_view = Some((url, s.map().camera));
         follow_style_view(s, web_time::Duration::ZERO);
     }
     Ok(out)
+}
+
+/// The date a dated tile layer starts at: the time slider's step. Its `start` (and `end`,
+/// `unit`, `interval` or `dates`) set the slider up, turning it on when it is off. Should a later
+/// check of the layer fail, the session restores the project, the slider with it (tested).
+fn dated_start(s: &mut Session, p: &Value) -> Result<f64, String> {
+    let keys = ["start", "end", "unit", "interval", "dates"];
+    let mut given: serde_json::Map<String, Value> = keys.iter().filter_map(|k| p.get(*k).map(|v| (k.to_string(), v.clone()))).collect();
+    if given.is_empty() {
+        return s
+            .map()
+            .time
+            .as_ref()
+            .map(|t| t.current)
+            .ok_or_else(|| "this address has dates: give its start (and end), or turn the time slider on first".to_string());
+    }
+    // Steps by what the address changes by: a day for `{date:YYYY-MM-DD}`, a year for `{YYYY}`.
+    if !given.contains_key("unit")
+        && let Some(u) = ps(p, "url").and_then(rustgis_data::time::template_unit)
+    {
+        given.insert("unit".into(), json!(u.code()));
+    }
+    super::time::set(s, &Value::Object(given))?;
+    Ok(s.map().time.as_ref().map_or(0.0, |t| t.current))
 }
 
 /// The most passes made waiting for a style to load (each waits for the fetches under way).
@@ -381,6 +424,10 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
         t.name = r.chars().take(120).collect();
     }
     if let Some(url) = new_url {
+        // A dated layer keeps the look at every date: its template takes it too.
+        if let Some(template) = t.time_url.as_mut() {
+            *template = cog::with_look(template, &cog::split(&url).1);
+        }
         t.url = url;
     }
     if let Some(mv) = ps(p, "move") {

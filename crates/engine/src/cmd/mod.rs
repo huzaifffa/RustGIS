@@ -38,6 +38,7 @@ pub mod sources;
 pub mod sql;
 pub mod stac;
 pub mod tiles;
+pub mod time;
 pub mod view;
 pub mod webdata;
 pub mod workflows;
@@ -93,6 +94,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(embeddings::commands());
     v.extend(earthdata::commands());
     v.extend(nldi::commands());
+    v.extend(time::commands());
     v
 }
 
