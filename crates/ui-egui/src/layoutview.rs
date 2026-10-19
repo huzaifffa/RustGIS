@@ -143,14 +143,16 @@ const HANDLE_PICK: f32 = 11.0;
 
 /// The selected element's resize handle at a screen point: the element and the handle (0..8
 /// clockwise from top-left), the nearest within reach. On a small element the reach shrinks, so
-/// its middle still moves it. Navigating, a map frame under the pointer pans instead: no handle.
+/// its inside still moves it; outside, it keeps a floor, so a thin element's handles can still be
+/// picked up. Navigating, a map frame under the pointer pans instead: no handle.
 fn handle_at(app: &RustGisApp, layout: &Layout, page: Rect, s: f32, pos: Pos2) -> Option<(u32, usize)> {
     if nav_frame(app, layout, page, s, pos).is_some() {
         return None;
     }
     let e = app.layout.selected.and_then(|id| layout.element(id))?;
     let r = Rect::from_min_max(to_screen(page, s, (e.x, e.y)), to_screen(page, s, (e.x + e.w, e.y + e.h)));
-    let reach = HANDLE_PICK.min((r.width().min(r.height()) / 3.0).max(5.0));
+    let third = r.width().min(r.height()) / 3.0;
+    let reach = HANDLE_PICK.min(if r.contains(pos) { third } else { third.max(5.0) });
     handles(r)
         .iter()
         .enumerate()
@@ -733,7 +735,9 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
         }
         return;
     }
-    if let Some(o) = ui.input(|i| i.pointer.press_origin()) {
+    if resp.is_pointer_button_down_on()
+        && let Some(o) = ui.input(|i| i.pointer.press_origin())
+    {
         app.layout.pressed = Some(o);
     }
     // Rulers and guides show they can be dragged.
@@ -768,12 +772,11 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
     }
     // A click on a ruler, or on the selected element's handle (which can stick out over another
     // element), keeps the selection: where the click started, as the pointer may have moved a
-    // little by the release.
+    // little by the release. A press serves one click or drag, never a later one.
+    let pressed = if resp.clicked() || resp.drag_started() { app.layout.pressed.take() } else { None };
     if resp.clicked()
         && let Some(p) = pointer_mm
-        && app
-            .layout
-            .pressed
+        && pressed
             .or(resp.interact_pointer_pos())
             .is_none_or(|pos| ruler_at(&app.layout, resp.rect, pos).is_none() && handle_at(app, layout, page, s, pos).is_none())
     {
