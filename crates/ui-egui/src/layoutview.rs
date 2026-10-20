@@ -89,6 +89,28 @@ pub struct LayoutView {
     /// Where the primary button last went down: egui forgets it on release, and a click is
     /// judged by where it started.
     pressed: Option<Pos2>,
+    /// The arrow-key nudges so far: how many runs of them there have been, and the last one's
+    /// layout, element and time (seconds), for [`LayoutView::nudge_key`].
+    nudges: u64,
+    nudged: Option<(usize, u32, f64)>,
+}
+
+/// How far (mm) an arrow key nudges the selected layout element, and with Shift.
+pub const NUDGE_MM: f64 = 1.0;
+pub const NUDGE_FAST_MM: f64 = 10.0;
+
+impl LayoutView {
+    /// The undo key for an arrow key nudging element `id` of layout `li` at `now` (seconds): the
+    /// last nudge's while the same element keeps being nudged, at most a second apart, so a held
+    /// key (or quick taps) is one step to undo.
+    pub fn nudge_key(&mut self, li: usize, id: u32, now: f64) -> String {
+        let same = self.nudged.is_some_and(|(l, i, t)| l == li && i == id && (0.0..=1.0).contains(&(now - t)));
+        if !same {
+            self.nudges = self.nudges.wrapping_add(1);
+        }
+        self.nudged = Some((li, id, now));
+        format!("layout nudge {}", self.nudges)
+    }
 }
 
 /// Forgets the selection and the text typed into its fields once another project has replaced
@@ -1830,6 +1852,59 @@ mod tests {
         h.run_steps(2);
         assert!(h.state().layout.frame_zoom.is_none());
         assert_eq!(h.state().session.revision, rev, "nothing was applied");
+    }
+
+    /// Arrow keys nudge the selected element 1 mm, 10 mm with Shift; a run of them, held or
+    /// tapped, is one step to undo; a locked element stays put.
+    #[test]
+    fn arrow_keys_nudge_the_selected_element_and_undo_as_one() {
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Nudge"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().clone();
+        app.layout.selected = Some(title.id);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                crate::chrome::shortcuts(app, &ctx);
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let key = |key, modifiers, repeat| Event::Key { key, physical_key: None, pressed: true, repeat, modifiers };
+        let at = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+            let e = h.state().session.project.layouts[li].element(title.id).unwrap();
+            (e.x - title.x, e.y - title.y)
+        };
+        let depth = h.state().session.undo_depth();
+        h.event(key(Key::ArrowRight, Modifiers::NONE, false));
+        h.step();
+        assert_eq!(at(&h), (1.0, 0.0), "→ nudges 1 mm");
+        h.event(key(Key::ArrowDown, Modifiers::SHIFT, false));
+        h.step();
+        assert_eq!(at(&h), (1.0, 10.0), "Shift-↓ nudges 10 mm");
+        // A held key repeats, several times in a frame.
+        for _ in 0..3 {
+            h.event(key(Key::ArrowLeft, Modifiers::NONE, true));
+        }
+        h.step();
+        assert_eq!(at(&h), (-2.0, 10.0));
+        assert_eq!(h.state().session.undo_depth(), depth + 1, "one step to undo, not five");
+        h.state_mut().run("edit.undo", serde_json::Value::Null).unwrap();
+        assert_eq!(at(&h), (0.0, 0.0), "one undo puts it back");
+
+        // A locked element stays put.
+        h.state_mut().run("layout.update", json!({"layout": li, "element": title.id, "locked": true})).unwrap();
+        h.event(key(Key::ArrowUp, Modifiers::NONE, false));
+        h.step();
+        assert_eq!(at(&h), (0.0, 0.0));
     }
 
     /// Ctrl+D (Cmd+D) duplicates the selected element and selects the copy; Backspace, the Mac's
