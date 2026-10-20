@@ -8111,6 +8111,53 @@ fn layout_arrows_keep_shallow_and_steep_angles_exactly() {
 }
 
 #[test]
+fn merged_undo_steps_undo_as_one() {
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Merge"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let title = s.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().clone();
+    let at = |s: &Session| s.project.layouts[li].element(title.id).map(|e| (e.x, e.y)).unwrap();
+    let nudge = |s: &mut Session, key: &str, x: f64| {
+        s.merge_undo(key);
+        s.run("layout.update", &json!({"element": title.id, "x": x})).unwrap();
+    };
+    let depth = s.undo_depth();
+    // A run under one key is one step.
+    for x in [10.0, 11.0, 12.0] {
+        nudge(&mut s, "a", x);
+    }
+    assert_eq!(s.undo_depth(), depth + 1);
+    // A change in between starts a new step, even under the same key; so does another key.
+    s.run("layout.update", &json!({"element": title.id, "y": 5.0})).unwrap();
+    nudge(&mut s, "a", 13.0);
+    nudge(&mut s, "b", 14.0);
+    assert_eq!(s.undo_depth(), depth + 4);
+    // Undoing a run goes back to before its first change.
+    for _ in 0..4 {
+        s.run("edit.undo", &Value::Null).unwrap();
+    }
+    assert_eq!(at(&s), (title.x, title.y));
+    // After an undo the same key starts afresh, not merging into the step before.
+    nudge(&mut s, "a", 20.0);
+    nudge(&mut s, "a", 21.0);
+    assert_eq!(s.undo_depth(), depth + 1);
+    // A key asked for by a command that failed is gone after it: the next change is its own step.
+    s.merge_undo("a");
+    assert!(s.run("layout.update", &json!({"element": 999_999, "x": 1})).is_err());
+    s.run("layout.update", &json!({"element": title.id, "x": 30.0})).unwrap();
+    assert_eq!(s.undo_depth(), depth + 2);
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(at(&s).0, 21.0);
+    // So is one asked for by a command refused before it ran (unknown, blocked).
+    nudge(&mut s, "c", 40.0);
+    s.merge_undo("c");
+    assert!(s.run("no.such.command", &Value::Null).is_err());
+    let before = s.undo_depth();
+    s.run("layout.update", &json!({"element": title.id, "x": 41.0})).unwrap();
+    assert_eq!(s.undo_depth(), before + 1);
+}
+
+#[test]
 fn layout_guides_are_set_kept_and_undone() {
     let mut s = world();
     s.run("layout.new", &json!({"name": "G"})).unwrap();
