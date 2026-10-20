@@ -686,11 +686,15 @@ impl Session {
     /// Runs a command by id. Mutating commands snapshot the project for undo; an error or a
     /// panic restores it.
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
+        // The merge key asked for ([`Session::merge_undo`]) goes to this command if it runs, and is
+        // gone if it's refused first, so it can't merge a later command into the last step.
+        let merge = if self.depth == 0 { self.merge.take() } else { None };
         // A style that loaded since: its view first, so the command sees where the map is.
         if self.style_view.is_some() {
             self.follow_style_view();
         }
         if id.starts_with(rustgis_plugins::PREFIX) {
+            self.merge = merge;
             return self.run_plugin(id, params);
         }
         let Some(&spec) = self.registry.get(id) else { return Err(format!("unknown command '{id}'")) };
@@ -726,6 +730,7 @@ impl Session {
             self.notify(e.clone(), true);
             return Err(e);
         }
+        self.merge = merge;
         let res = self.guarded(label, mutates, |s| run(s, params));
         // What was added, for the Data Sources pane's Recent list.
         if res.is_ok()
@@ -1017,8 +1022,6 @@ impl Session {
         self.redo.last().map(|u| u.2)
     }
 
-    /// Forgets undo/redo and extent history and marks the project clean (after new/open, or a
-    /// front end setting up how the project starts): what [`PutAside`] holds, dropped.
     /// Makes the next command's undo step part of the last one, when that was made under the same
     /// `key`: a held arrow key nudging a layout element is one step to undo, not one per repeat
     /// (and doesn't push the work before it out of the history). Any other change in between,
@@ -1027,6 +1030,8 @@ impl Session {
         self.merge = Some(key.into());
     }
 
+    /// Forgets undo/redo and extent history and marks the project clean (after new/open, or a
+    /// front end setting up how the project starts): what [`PutAside`] holds, dropped.
     pub fn clear_history(&mut self) {
         drop(self.take_project_state());
         self.project_starts = self.project_starts.wrapping_add(1);

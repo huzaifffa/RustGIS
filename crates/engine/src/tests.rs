@@ -8051,6 +8051,13 @@ fn merged_undo_steps_undo_as_one() {
     assert_eq!(s.undo_depth(), depth + 2);
     s.run("edit.undo", &Value::Null).unwrap();
     assert_eq!(at(&s).0, 21.0);
+    // So is one asked for by a command refused before it ran (unknown, blocked).
+    nudge(&mut s, "c", 40.0);
+    s.merge_undo("c");
+    assert!(s.run("no.such.command", &Value::Null).is_err());
+    let before = s.undo_depth();
+    s.run("layout.update", &json!({"element": title.id, "x": 41.0})).unwrap();
+    assert_eq!(s.undo_depth(), before + 1);
 }
 
 #[test]
