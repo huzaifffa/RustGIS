@@ -1503,8 +1503,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         ui.label(tl!("Angle"));
                         let current = line_angle((e.x, e.y, e.w, e.h), *dir, *head);
                         let mut a = current;
+                        let drag = Dragged::lend(ui, drag_key("angle"), &mut a);
                         let r = ui.add(egui::DragValue::new(&mut a).range(-180.0..=180.0).speed(1.0).max_decimals(1).suffix("°"));
-                        if (r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged())) && (a - current).abs() > 1e-6 {
+                        if drag.settled(ui, &r, &mut a) && (a - current).abs() > 1e-6 {
                             update(app, json!({"angle": a}));
                         }
                         ui.end_row();
@@ -2206,6 +2207,52 @@ mod tests {
         // Applied once, on release: one undo step, not one a frame of the drag.
         assert_eq!(h.state().session.undo_depth(), undo + 1, "one undo step");
         assert_eq!(h.state().session.undo_label(), Some("Element Properties"));
+    }
+
+    #[test]
+    fn dragging_the_angle_in_the_format_pane_turns_the_arrow() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::{ElementKind, line_angle};
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Turn", "template": "blank"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let id =
+            app.run("layout.addElement", json!({"kind": "arrow", "angle": 0, "length": 60})).unwrap()["element"].as_u64().unwrap() as u32;
+        app.layout.selected = Some(id);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        // Angle is the line's last number, the bottommost.
+        let at = h.query_all_by_role(Role::SpinButton).map(|n| n.rect()).max_by(|a, b| a.min.y.total_cmp(&b.min.y)).unwrap().center();
+        let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let undo = h.state().session.undo_depth();
+        h.event(Event::PointerMoved(at));
+        h.step();
+        h.event(button(at, true));
+        h.step();
+        // Dragged right over several frames, then let go without moving: the turn is kept.
+        for i in 1..=4 {
+            h.event(Event::PointerMoved(at + vec2(10.0 * i as f32, 0.0)));
+            h.step();
+        }
+        h.event(button(at + vec2(40.0, 0.0), false));
+        h.run_steps(3);
+        let e = h.state().session.project.layouts[li].element(id).unwrap().clone();
+        let ElementKind::Line { dir, head, .. } = e.kind else { panic!("{:?}", e.kind) };
+        let a = line_angle((e.x, e.y, e.w, e.h), dir, head);
+        assert!(a > 10.0, "turned to {a}°");
+        assert_eq!(h.state().session.undo_depth(), undo + 1, "one undo step");
     }
 
     /// A layout's text has the shared text form (#516): the page's dynamic text as well as the

@@ -8104,6 +8104,7 @@ fn layout_arrows_keep_shallow_and_steep_angles_exactly() {
     assert!((a - 60.0).abs() < 1e-9 && (len - 40.0).abs() < 1e-9 && x == 50.0, "{a}° {len} mm at {x}");
     // A length is more than 0 when added too, and a dir doesn't come with an angle or a length.
     assert!(s.run("layout.addElement", &json!({"kind": "arrow", "angle": 10, "length": 0})).is_err());
+    assert!(s.run("layout.addElement", &json!({"kind": "line", "angle": 10, "dir": "falling"})).is_err());
     for bad in [json!({"element": id, "dir": "rising", "angle": 10}), json!({"element": id, "dir": "falling", "length": 30})] {
         assert!(s.run("layout.update", &bad).is_err(), "{bad}");
     }
