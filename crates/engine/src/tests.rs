@@ -7913,7 +7913,7 @@ fn layout_shapes_are_added_restyled_and_saved() {
         k => panic!("{k:?}"),
     }
     match &l.element(line).unwrap().kind {
-        ElementKind::Line { color, width, dir } => assert_eq!((color.hex(), *width, *dir), ("#123456".into(), 3.0, LineDir::Rising)),
+        ElementKind::Line { color, width, dir, .. } => assert_eq!((color.hex(), *width, *dir), ("#123456".into(), 3.0, LineDir::Rising)),
         k => panic!("{k:?}"),
     }
     // Bad values change nothing.
@@ -7950,6 +7950,66 @@ fn layout_shapes_are_added_restyled_and_saved() {
     // Saved and read back.
     let back: rustgis_map::layout::Layout = serde_json::from_value(serde_json::to_value(&s.project.layouts[li]).unwrap()).unwrap();
     assert_eq!(back, s.project.layouts[li]);
+}
+
+#[test]
+fn layout_arrows_point_turn_and_keep_their_length() {
+    use rustgis_map::layout::{ElementKind, LineHead, line_angle, line_length};
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Arrows", "template": "blank"})).unwrap();
+    let li = s.active_layout.unwrap();
+    // The angle, length, heads and name of a line element.
+    let read = |s: &Session, id: u32| {
+        let e = s.project.layouts[li].element(id).unwrap();
+        match e.kind {
+            ElementKind::Line { dir, head, .. } => {
+                let r = (e.x, e.y, e.w, e.h);
+                (line_angle(r, dir, head), line_length(r, dir), head, e.name.clone(), (e.x + e.w / 2.0, e.y + e.h / 2.0))
+            }
+            ref k => panic!("{k:?}"),
+        }
+    };
+    let id = s.run("layout.addElement", &json!({"kind": "arrow", "angle": 45, "length": 50})).unwrap()["element"].as_u64().unwrap() as u32;
+    let (a, len, head, name, centre) = read(&s, id);
+    assert!((a - 45.0).abs() < 1e-9 && (len - 50.0).abs() < 1e-9, "{a}° {len} mm");
+    assert_eq!((head, name.as_str()), (LineHead::End, "Arrow"));
+
+    // Turned to point left: the head moves to the line's start; length and centre stay.
+    s.run("layout.update", &json!({"element": id, "angle": 180})).unwrap();
+    let (a, len, head, _, c) = read(&s, id);
+    assert!((a.abs() - 180.0).abs() < 1e-9 && (len - 50.0).abs() < 1e-9, "{a}° {len} mm");
+    assert_eq!(head, LineHead::Start);
+    assert!((c.0 - centre.0).abs() < 1e-9 && (c.1 - centre.1).abs() < 1e-9);
+    // Made longer, it keeps pointing the same way.
+    s.run("layout.update", &json!({"element": id, "length": 80})).unwrap();
+    let (a, len, ..) = read(&s, id);
+    assert!((a.abs() - 180.0).abs() < 1e-9 && (len - 80.0).abs() < 1e-9);
+    // Two heads, then none: a plain line.
+    s.run("layout.update", &json!({"element": id, "head": "both"})).unwrap();
+    assert_eq!(read(&s, id).2, LineHead::Both);
+
+    // A plain line takes an angle too; other elements don't.
+    let line = s.run("layout.addElement", &json!({"kind": "line", "angle": -30})).unwrap()["element"].as_u64().unwrap() as u32;
+    assert_eq!(read(&s, line).3, "Line");
+    let rect = s.run("layout.addElement", &json!({"kind": "rectangle", "w": 20, "h": 20})).unwrap()["element"].as_u64().unwrap() as u32;
+    for bad in [
+        json!({"element": rect, "angle": 10}),
+        json!({"element": id, "head": "sideways"}),
+        json!({"element": id, "angle": "steep"}),
+        json!({"element": id, "length": 0}),
+        json!({"element": id, "length": -5}),
+    ] {
+        assert!(s.run("layout.update", &bad).is_err(), "{bad}");
+    }
+    assert!(s.run("layout.addElement", &json!({"kind": "arrow", "head": "up"})).is_err());
+    assert_eq!(read(&s, id).2, LineHead::Both, "bad values changed nothing");
+    // Undo turns it back.
+    s.run("edit.undo", &Value::Null).unwrap(); // the rectangle
+    s.run("edit.undo", &Value::Null).unwrap(); // the line
+    s.run("edit.undo", &Value::Null).unwrap(); // both heads
+    s.run("edit.undo", &Value::Null).unwrap(); // the length
+    let (a, len, ..) = read(&s, id);
+    assert!((a.abs() - 180.0).abs() < 1e-9 && (len - 50.0).abs() < 1e-9);
 }
 
 #[test]

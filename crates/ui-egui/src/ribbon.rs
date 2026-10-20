@@ -2804,6 +2804,8 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
             if small(ui, app, "g_ellipse", "Ellipse", "Add an ellipse.", "ui.menu", Value::Null, false).clicked() {
                 add(app, json!({"kind": "ellipse"}));
             }
+        });
+        col(ui, |ui| {
             small_menu(ui, app, "g_line", "Line", "Add a straight line.", |ui, app| {
                 for d in rustgis_engine::map::layout::LineDir::ALL {
                     if ui.button(tl!(d.label())).clicked() {
@@ -2812,6 +2814,11 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
                     }
                 }
             });
+            // Pointing right; the round handle above it turns it any way.
+            let desc = "Add an arrow. Turn it with the round handle above it, or set its angle in its properties.";
+            if small(ui, app, "g_arrow", "Arrow", desc, "ui.menu", Value::Null, false).clicked() {
+                add(app, json!({"kind": "arrow", "angle": 0}));
+            }
         });
     });
     group(ui, "Text", |ui| {

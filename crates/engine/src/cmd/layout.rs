@@ -6,9 +6,9 @@ use std::path::Path;
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::Rgba;
 use rustgis_map::layout::{
-    ArrowStyle, CoordFormat, ElementKind, FrameShape, Grid, GridEdges, GridStyle, Guides, Layout, LineDir, MAX_COLORBAR_TICKS,
+    ArrowStyle, CoordFormat, ElementKind, FrameShape, Grid, GridEdges, GridStyle, Guides, Layout, LineDir, LineHead, MAX_COLORBAR_TICKS,
     MAX_GRID_WIDTH, MAX_GUIDES, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries, Orientation, PAGES, ScaleBarStyle, ScaleUnits,
-    TextAlign, TickSide, fit_scale,
+    TextAlign, TickSide, fit_scale, line_angle, line_at_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -82,10 +82,10 @@ pub fn commands() -> Vec<C> {
             r#"{"layout"?, "shape"?: "rectangle"|"circle"|"ellipse"|"polygon"|"lasso", "points"?: [[u, v], …] (polygon/lasso, 0..1 across the frame), "map"?: name, "x"?, "y"?, "w"?, "h"?: mm}"#,
         ),
         C::new("layout.addElement", "Add Element", "Publish › Map Surrounds", add_element).params(
-            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA", "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees (0 picks one), "labels"?: bool, "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar), "x"?, "y"?, "w"?, "h"?: mm}"##,
+            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA", "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page (line, arrow), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees (0 picks one), "labels"?: bool, "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar), "x"?, "y"?, "w"?, "h"?: mm}"##,
         ),
         C::new("layout.update", "Element Properties", "Publish › Element", update).params(
-            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line), "bold"?, "italic"?, "align"?, "letterSpacing"? (text), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse; for a rectangle or ellipse, color sets it when outline is not given), "width"?: points (rectangle, ellipse, line), "dir"? (line), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?}"##,
+            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line), "bold"?, "italic"?, "align"?, "letterSpacing"? (text), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse; for a rectangle or ellipse, color sets it when outline is not given), "width"?: points (rectangle, ellipse, line), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?}"##,
         ),
         C::new("layout.guides", "Guides", "Publish › Page Setup", guides).params(
             r#"{"layout"?, "x"?: [mm] (vertical guides, from the page's left edge), "y"?: [mm] (horizontal guides, from its top edge), "clear"?: bool (remove every guide first)}"#,
@@ -361,6 +361,23 @@ fn shape_width(p: &Value, default: f64) -> Result<f64, String> {
     }
 }
 
+/// A line's "head": `default` when it's not given (or null), an error when it's not an
+/// arrowhead's name.
+fn line_head(p: &Value, default: LineHead) -> Result<LineHead, String> {
+    match p.get("head").filter(|v| !v.is_null()) {
+        Some(v) => v.as_str().and_then(LineHead::from_name).ok_or_else(|| format!("unknown arrowhead {v} (none, end, start or both)")),
+        None => Ok(default),
+    }
+}
+
+/// A number given as `k`, when it's given (and not null): an error when it's not a number.
+fn given_num(p: &Value, k: &str, what: &str) -> Result<Option<f64>, String> {
+    match p.get(k).filter(|v| !v.is_null()) {
+        Some(_) => f(p, k).map(Some).ok_or_else(|| format!("{k} is {what}")),
+        None => Ok(None),
+    }
+}
+
 /// A line's "dir": `default` when it's not given (or null), an error when it's not a direction's
 /// name.
 fn line_dir(p: &Value, default: LineDir) -> Result<LineDir, String> {
@@ -574,21 +591,31 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
             let name = if kind == "circle" { "Circle" } else { "Ellipse" };
             (name, place(p, l, ((pw - w) / 2.0, (ph - h) / 2.0, w, h))?, k)
         }
-        "line" => {
-            let dir = line_dir(p, LineDir::Horizontal)?;
-            let k = ElementKind::Line {
-                color: color(p, "color", Rgba::rgb(0x22, 0x22, 0x22))?,
-                width: shape_width(p, 1.0)?.clamp(0.1, 50.0),
-                dir,
-            };
-            // The box is the line's, with room either side to pick it up by.
+        "line" | "arrow" => {
+            let arrow = kind == "arrow";
+            let head = line_head(p, if arrow { LineHead::End } else { LineHead::None })?;
+            let color = color(p, "color", Rgba::rgb(0x22, 0x22, 0x22))?;
+            let width = shape_width(p, if arrow { 1.5 } else { 1.0 })?.clamp(0.1, 50.0);
             let len = (pw.min(ph) * 0.4).max(10.0);
-            let (w, h) = match dir {
-                LineDir::Horizontal => (len, 6.0),
-                LineDir::Vertical => (6.0, len),
-                LineDir::Falling | LineDir::Rising => (len, len * 0.6),
+            let name = if head == LineHead::None { "Line" } else { "Arrow" };
+            // At an angle, centred on the page; else the box is the direction's, with room either
+            // side of a level or upright line to pick it up by.
+            let (default, dir, head) = match given_num(p, "angle", "a number of degrees")? {
+                Some(angle) => {
+                    let length = given_num(p, "length", "a number of mm")?.unwrap_or(len);
+                    line_at_angle((pw / 2.0, ph / 2.0), length, angle, head)
+                }
+                None => {
+                    let dir = line_dir(p, LineDir::Horizontal)?;
+                    let (w, h) = match dir {
+                        LineDir::Horizontal => (len, 6.0),
+                        LineDir::Vertical => (6.0, len),
+                        LineDir::Falling | LineDir::Rising => (len, len * 0.6),
+                    };
+                    (((pw - w) / 2.0, (ph - h) / 2.0, w, h), dir, head)
+                }
             };
-            ("Line", place(p, l, ((pw - w) / 2.0, (ph - h) / 2.0, w, h))?, k)
+            (name, place(p, l, default)?, ElementKind::Line { color, width, dir, head })
         }
         "extentIndicator" => {
             let frame = frame_of(l, p)?;
@@ -847,13 +874,14 @@ fn restyle(kind: &ElementKind, p: &Value) -> Result<Option<ElementKind>, String>
                 _ => ElementKind::Rectangle { fill, outline, width },
             }))
         }
-        ElementKind::Line { color: c, width, dir } => {
-            if ["color", "width", "dir"].iter().all(|k| p.get(k).is_none()) {
+        ElementKind::Line { color: c, width, dir, head } => {
+            if ["color", "width", "dir", "head"].iter().all(|k| p.get(k).is_none()) {
                 return Ok(None);
             }
             let dir = line_dir(p, *dir)?;
+            let head = line_head(p, *head)?;
             let width = shape_width(p, *width)?.clamp(0.1, 50.0);
-            Ok(Some(ElementKind::Line { color: color(p, "color", *c)?, width, dir }))
+            Ok(Some(ElementKind::Line { color: color(p, "color", *c)?, width, dir, head }))
         }
         _ => Ok(None),
     }
@@ -973,6 +1001,25 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         };
         (restyle(kind, p)?, grid, indicator)
     };
+    // A line turned to an "angle" or made a "length" long, about its centre: its new box,
+    // direction and heads.
+    let (angle, length) = (given_num(p, "angle", "a number of degrees")?, given_num(p, "length", "a number of mm")?);
+    let new_line = match (angle, length) {
+        (None, None) => None,
+        _ => {
+            let e = s.project.layouts.get(li).and_then(|l| l.element(id)).ok_or_else(|| format!("no element {id}"))?;
+            let ElementKind::Line { dir, head, .. } = restyled.as_ref().unwrap_or(&e.kind) else {
+                return Err("only lines and arrows take an angle or a length".into());
+            };
+            let r = (e.x, e.y, e.w, e.h);
+            let length = length.unwrap_or_else(|| line_length(r, *dir));
+            if length <= 0.0 {
+                return Err("length is more than 0 mm".into());
+            }
+            let angle = angle.unwrap_or_else(|| line_angle(r, *dir, *head));
+            Some(line_at_angle((e.x + e.w / 2.0, e.y + e.h / 2.0), length, angle, *head))
+        }
+    };
     let map_name = match ps(p, "map") {
         Some(n) => Some(
             s.project
@@ -1036,6 +1083,12 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Some(k) = restyled {
         e.kind = k;
+    }
+    if let Some(((x, y, w, h), d, hd)) = new_line {
+        (e.x, e.y, e.w, e.h) = (x, y, w, h);
+        if let ElementKind::Line { dir, head, .. } = &mut e.kind {
+            (*dir, *head) = (d, hd);
+        }
     }
     match &mut e.kind {
         ElementKind::Text { text, size, color, bold, italic, align, letter_spacing } => {
