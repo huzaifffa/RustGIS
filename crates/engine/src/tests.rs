@@ -8074,6 +8074,42 @@ fn layout_arrows_point_turn_and_keep_their_length() {
 }
 
 #[test]
+fn layout_arrows_keep_shallow_and_steep_angles_exactly() {
+    use rustgis_map::layout::{ElementKind, line_angle, line_length};
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Arrows", "template": "blank"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let read = |s: &Session, id: u32| {
+        let e = s.project.layouts[li].element(id).unwrap();
+        match e.kind {
+            ElementKind::Line { dir, head, .. } => {
+                let r = (e.x, e.y, e.w, e.h);
+                (line_angle(r, dir, head), line_length(r, dir), (e.x, e.y))
+            }
+            ref k => panic!("{k:?}"),
+        }
+    };
+    let add = |s: &mut Session, p: Value| s.run("layout.addElement", &p).unwrap()["element"].as_u64().unwrap() as u32;
+    // A box under 5 mm one way is not stretched to the minimum a dragged element gets.
+    for (angle, length) in [(3.0, 60.0), (85.0, 50.0), (-2.0, 40.0)] {
+        let id = add(&mut s, json!({"kind": "arrow", "angle": angle, "length": length}));
+        let (a, len, _) = read(&s, id);
+        assert!((a - angle).abs() < 1e-9 && (len - length).abs() < 1e-9, "{angle}°: {a}° {len} mm");
+    }
+    // x and y move an angled line without bending it, when added or turned.
+    let id = add(&mut s, json!({"kind": "arrow", "angle": 30, "length": 40, "x": 12, "y": 34}));
+    assert_eq!(read(&s, id).2, (12.0, 34.0));
+    s.run("layout.update", &json!({"element": id, "angle": 60, "x": 50})).unwrap();
+    let (a, len, (x, _)) = read(&s, id);
+    assert!((a - 60.0).abs() < 1e-9 && (len - 40.0).abs() < 1e-9 && x == 50.0, "{a}° {len} mm at {x}");
+    // A length is more than 0 when added too, and a dir doesn't come with an angle or a length.
+    assert!(s.run("layout.addElement", &json!({"kind": "arrow", "angle": 10, "length": 0})).is_err());
+    for bad in [json!({"element": id, "dir": "rising", "angle": 10}), json!({"element": id, "dir": "falling", "length": 30})] {
+        assert!(s.run("layout.update", &bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn layout_guides_are_set_kept_and_undone() {
     let mut s = world();
     s.run("layout.new", &json!({"name": "G"})).unwrap();

@@ -166,7 +166,6 @@ fn handle_at(app: &RustGisApp, layout: &Layout, page: Rect, s: f32, pos: Pos2) -
         .map(|(i, _)| (e.id, i))
 }
 
-/// The cursor for dragging handle `h`.
 /// How far (points) above a selected line or arrow its rotation handle sits.
 const ROTATE_GAP: f32 = 22.0;
 
@@ -212,6 +211,7 @@ fn turned(start: f64, from: f64, to: f64, steps: bool) -> f64 {
     (a + 180.0).rem_euclid(360.0) - 180.0
 }
 
+/// The cursor for dragging handle `h`.
 fn handle_cursor(h: usize) -> CursorIcon {
     match h {
         0 | 4 => CursorIcon::ResizeNwSe,
