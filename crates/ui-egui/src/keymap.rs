@@ -236,6 +236,18 @@ impl Keymap {
     }
 }
 
+/// A key as a browser's keyboard event names it: by its `key` (`d`, `=`, `+`), else by its
+/// `code` (`KeyD`, `Digit1`, `Equal`, `Minus`), which stays put when Alt (⌥) changes the
+/// character a Mac types.
+pub fn browser_key(key: &str, code: &str) -> Option<Key> {
+    let by_name = |s: &str| Key::from_name(s).or_else(|| Key::from_name(&s.to_ascii_uppercase()));
+    by_name(key).or_else(|| match code {
+        "Equal" => Some(Key::Equals),
+        "Minus" => Some(Key::Minus),
+        c => by_name(c.strip_prefix("Key").or_else(|| c.strip_prefix("Digit")).unwrap_or(c)),
+    })
+}
+
 /// Whether a key combination is one of the [`CLIPBOARD`] keys.
 pub fn is_clipboard(chord: Chord) -> bool {
     CLIPBOARD.iter().any(|(keys, _)| Chord::parse(keys) == Some(chord))
@@ -274,6 +286,43 @@ pub fn label(app: &RustGisApp, command: &str, params: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_keys_read_by_key_or_code() {
+        assert_eq!(browser_key("d", "KeyD"), Some(Key::D));
+        assert_eq!(browser_key("D", "KeyD"), Some(Key::D));
+        assert_eq!(browser_key("=", "Equal"), Some(Key::Equals));
+        assert_eq!(browser_key("+", "Equal"), Some(Key::Plus));
+        assert_eq!(browser_key("-", "Minus"), Some(Key::Minus));
+        // ⌥D types ∂ on a Mac: the key's code still says D.
+        assert_eq!(browser_key("∂", "KeyD"), Some(Key::D));
+        assert_eq!(browser_key("¡", "Digit1"), Some(Key::Num1));
+        assert_eq!(browser_key("Dead", "Unidentified"), None);
+    }
+
+    /// In a browser, the app's Ctrl (⌘) shortcuts are kept from the browser (⌘D would bookmark
+    /// the page), the clipboard's and keys the app doesn't use are left to it.
+    #[test]
+    fn the_app_takes_its_shortcuts_from_the_browser() {
+        let app = crate::RustGisApp::with_sample();
+        let keys = app.command_keys();
+        let takes = |key: &str, code: &str, cmd: bool, alt: bool, shift: bool| {
+            crate::RustGisApp::takes_browser_key(&keys, key, code, cmd, alt, shift)
+        };
+        assert!(takes("d", "KeyD", true, false, false), "⌘D: duplicate, not bookmark");
+        assert!(takes("y", "KeyY", true, false, false), "⌘Y: redo, not history");
+        assert!(takes("k", "KeyK", true, false, false), "Ctrl+K: command search, not the address bar");
+        assert!(takes("=", "Equal", true, false, false) && takes("+", "Equal", true, false, true), "⌘= and ⌘+ zoom the map, not the page");
+        assert!(takes("z", "KeyZ", true, false, true), "⌘⇧Z: redo");
+        // Without Ctrl (⌘), and keys the app leaves alone, go to the browser.
+        assert!(!takes("d", "KeyD", false, false, false));
+        assert!(!takes("r", "KeyR", true, false, false), "⌘R reloads");
+        assert!(!takes("l", "KeyL", true, false, false), "⌘L: the address bar");
+        // Copy, cut and paste must reach the page as the browser's clipboard events.
+        for (k, c) in [("c", "KeyC"), ("x", "KeyX"), ("v", "KeyV")] {
+            assert!(!takes(k, c, true, false, false), "⌘{k}");
+        }
+    }
 
     #[test]
     fn chords_read_and_write() {

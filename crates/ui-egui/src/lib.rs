@@ -748,6 +748,32 @@ pub struct RustGisApp {
 }
 
 impl RustGisApp {
+    /// The Ctrl (⌘) shortcuts the keymap takes, as (Alt, Shift, key), the clipboard's left out:
+    /// in a browser, what the web app keeps from the browser's own shortcuts (⌘D bookmarking
+    /// the page, ⌘Y opening its history, ⌘= zooming it), as design tools in the browser do.
+    pub fn command_keys(&self) -> Vec<(bool, bool, egui::Key)> {
+        let mut keys: Vec<(bool, bool, egui::Key)> = self
+            .ui
+            .keymap
+            .match_order()
+            .into_iter()
+            .map(|b| b.chord)
+            .filter(|c| c.command && !keymap::is_clipboard(*c))
+            .map(|c| (c.alt, c.shift, c.key))
+            .collect();
+        keys.sort_by_key(|k| (k.0, k.1, k.2 as u32));
+        keys.dedup();
+        keys
+    }
+
+    /// Whether a browser key press (its `key` and `code`, Ctrl or ⌘ held, Alt, Shift) is one of
+    /// [`RustGisApp::command_keys`]: as egui matches a shortcut, an extra Alt or Shift doesn't
+    /// stop it (⌘+ is ⌘⇧= on most keyboards).
+    pub fn takes_browser_key(keys: &[(bool, bool, egui::Key)], key: &str, code: &str, command: bool, alt: bool, shift: bool) -> bool {
+        command
+            && keymap::browser_key(key, code).is_some_and(|k| keys.iter().any(|&(a, s, bound)| bound == k && (!a || alt) && (!s || shift)))
+    }
+
     /// egui's wgpu render state from the host (`frame.wgpu_render_state()`), feeding the GPU
     /// map backend. Cheap to call every frame: the state is Arc-backed.
     pub fn set_render_state(&mut self, rs: Option<egui_wgpu::RenderState>) {
