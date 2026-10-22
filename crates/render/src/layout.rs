@@ -28,6 +28,28 @@ pub struct PageInfo {
 const MAX_SIDE: f64 = 12_000.0;
 const MAX_PIXELS: f64 = if cfg!(target_arch = "wasm32") { 25_000_000.0 } else { 60_000_000.0 };
 
+/// Whether skipping a failed frame would omit required complete-source content.
+pub(crate) fn frame_requires_complete(map: &Map, view: &View) -> bool {
+    let mut scales = vec![map.ground_res_at(&view.camera) / rustgis_geom::PIXEL_M];
+    if view.camera.pitch != 0.0 && !map.projection.is_globe() {
+        scales.extend(view.camera.tilt_bands(view.width, view.height).iter().map(|b| map.ground_res_at(&b.camera) / rustgis_geom::PIXEL_M));
+    }
+    let complete = |source: &rustgis_map::source::SourceLayer| {
+        source.chunk_source().is_some() || (!source.is_open() && crate::is_local_shapefile(source))
+    };
+    map.layers.iter().filter(|l| scales.iter().any(|scale| map.draws_at(l, *scale))).any(|layer| {
+        layer.source.as_ref().is_some_and(complete)
+            || layer
+                .mask
+                .as_deref()
+                .and_then(|name| {
+                    map.layers.iter().find(|m| m.name.eq_ignore_ascii_case(name) && m.geometry_type() == GeometryType::Polygon)
+                })
+                .and_then(|mask| mask.source.as_ref())
+                .is_some_and(complete)
+    })
+}
+
 /// Renders a layout at `dpi` (dots per inch). `maps` are the project's maps, found by name.
 pub fn render(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<Pixmap> {
     let ppp = (if dpi.is_finite() { dpi } else { 96.0 } / 96.0).clamp(0.25, 8.0);
@@ -67,7 +89,7 @@ pub fn render(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> O
             let lonlat = crate::view_lonlat(map, &view);
             let scale = map.ground_res_at(&cam) / rustgis_geom::PIXEL_M;
             map.sync_sources(&lonlat, scale, true);
-            shown.push((*f, shown_legends(map, scale)));
+            shown.push((*f, complete_shown_legends(map, scale)?));
         }
     }
     for e in layout.elements.iter().filter(|e| e.visible) {
@@ -83,7 +105,13 @@ pub fn render(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> O
                 // A frame larger than the page budget is drawn at a lower resolution and scaled up.
                 let fppp = ppp.min((MAX_PIXELS / (fw * fh).max(1.0)).sqrt()).max(0.01);
                 let view = View { width: fw, height: fh, pixels_per_point: fppp, camera: cam, sky: false };
-                let Some(mut img) = crate::render_complete(map, &view) else { continue };
+                let Some(mut img) = crate::render_complete(map, &view) else {
+                    if frame_requires_complete(map, &view) {
+                        return None;
+                    }
+                    // Preserve upstream's best-effort page export for ordinary maps.
+                    continue;
+                };
                 for l in img.unplaced.iter().chain(&img.labels) {
                     text::draw(&mut img.pixmap, l, fppp as f32);
                 }
@@ -170,10 +198,11 @@ pub fn render(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> O
                     None => placeholder(&mut pm, r, "Colorbar", ppp),
                 }
             }
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing } => {
+            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font } => {
                 let first = layout.first_frame().and_then(frame);
                 let s = expand(t, layout, info, first.and_then(|f| maps.get(f.1).map(|m| (m, f.2))));
-                let style = TextStyle { bold: *bold, italic: *italic, align: *align, spacing: *letter_spacing as f32 };
+                let face = text::Face { bold: *bold, italic: *italic, serif: *font == rustgis_map::layout::FontFamily::Serif };
+                let style = TextStyle { face, align: *align, spacing: *letter_spacing as f32 };
                 text_block(&mut pm, r, &s, *size as f32, *color, style, ppp);
             }
             ElementKind::Picture { image } => {
@@ -750,6 +779,65 @@ fn shown_legends(map: &Map, scale: f64) -> Vec<(u32, Vec<LegendEntry>)> {
         .collect()
 }
 
+/// Complete-source legends retain one minimal value per used class, never its geometry.
+fn complete_shown_legends(map: &mut Map, scale: f64) -> Option<Vec<(u32, Vec<LegendEntry>)>> {
+    if !map.layers.iter().any(|l| l.source.as_ref().and_then(|s| s.chunk_source()).is_some()) {
+        return Some(shown_legends(map, scale));
+    }
+    let wanted: Vec<usize> =
+        map.layers.iter().enumerate().filter(|(_, l)| map.draws_at(l, scale) && !l.graphics && !l.is_raster()).map(|(i, _)| i).collect();
+    let mut out = Vec::new();
+    for index in wanted {
+        let layer = map.layers.get_mut(index)?;
+        let Some(source) = layer.source.as_ref().and_then(|s| s.chunk_source()) else {
+            if let Some(entries) = layer.shown_legend(scale) {
+                out.push((layer.id, entries));
+            }
+            continue;
+        };
+        let unique = match &layer.renderer {
+            rustgis_map::Renderer::Unique { field, classes, .. } => Some((field, classes)),
+            _ => None,
+        };
+        let fi = unique.and_then(|(field, _)| layer.dataset.field_index(field));
+        let fields = unique
+            .filter(|_| fi.is_some())
+            .map_or_else(Vec::new, |(field, _)| vec![rustgis_data::Field::new(field, rustgis_data::FieldType::Text)]);
+        let mut sample = rustgis_data::Dataset::new("legend", layer.geometry_type(), fields);
+        let mut used = std::collections::HashSet::new();
+        let mut any = false;
+        let mut chunk = layer.clone();
+        chunk.source = None;
+        chunk.clear_cache();
+        let result = crate::visit_complete(source.as_ref(), &mut |features| {
+            chunk.dataset.features = features.into();
+            let rows = chunk.drawn_rows(scale);
+            for row in rows.iter().enumerate().filter_map(|(row, keep)| keep.then_some(row)) {
+                any = true;
+                if let Some((_, classes)) = unique {
+                    let value = fi.map(|fi| chunk.dataset.value(row, fi).to_string());
+                    let key = value.as_ref().and_then(|v| classes.iter().position(|(k, _)| k == v)).unwrap_or(classes.len());
+                    if used.insert(key) {
+                        sample.push(None, value.map_or_else(Vec::new, |v| vec![rustgis_data::Value::Text(v)]));
+                    }
+                }
+            }
+            chunk.dataset.features = Vec::new().into();
+            Ok(())
+        });
+        if let Err(e) = result {
+            if let Some(source) = &mut layer.source {
+                source.error = Some(e.to_string());
+            }
+            return None;
+        }
+        if any {
+            out.push((layer.id, layer.renderer.legend_for(&sample, &[])));
+        }
+    }
+    Some(out)
+}
+
 /// What a legend leaves out: `<all other values>`, and layers by name.
 struct LegendOptions<'a> {
     hide_other: bool,
@@ -1014,8 +1102,8 @@ fn colorbar(pm: &mut Pixmap, r: Rect, scale: &ColorScale, bar: &Bar, ppp: f64) {
 /// How a text element's lines are drawn, beyond their size and colour.
 #[derive(Clone, Copy)]
 struct TextStyle {
-    bold: bool,
-    italic: bool,
+    /// Bold, italic and the family.
+    face: text::Face,
     align: TextAlign,
     /// Letter spacing in points.
     spacing: f32,
@@ -1039,12 +1127,12 @@ fn text_block(pm: &mut Pixmap, r: Rect, s: &str, size: f32, color: Rgba, style: 
         let left = match style.align {
             TextAlign::Left => r.x(),
             aligned => {
-                let (ink_left, ink_right) = text::styled_extent(line, px, style.bold, style.italic, spacing);
+                let (ink_left, ink_right) = text::styled_extent(line, px, style.face, spacing);
                 let free = r.width() - (ink_right - ink_left);
                 r.x() + if aligned == TextAlign::Center { free / 2.0 } else { free } - ink_left
             }
         };
-        text::styled_at(pm, line, left, y, px, color, style.bold, style.italic, spacing);
+        text::styled_at(pm, line, left, y, px, color, style.face, spacing);
         y += px * 1.25;
     }
 }
@@ -1371,7 +1459,7 @@ mod tests {
     /// as before.
     #[test]
     fn text_takes_italic_alignment_and_letter_spacing() {
-        let plain = TextStyle { bold: false, italic: false, align: TextAlign::Left, spacing: 0.0 };
+        let plain = TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0 };
         let base = styled_line(plain);
         let (l, r, ..) = text_ink(&base);
         assert!(l < 4, "left-aligned starts at the left: {l}");
@@ -1397,7 +1485,7 @@ mod tests {
             let mut pm = Pixmap::new(120, 120).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
             let r = Rect::from_xywh(40.0, 0.0, 80.0, 120.0).unwrap();
-            text_block(&mut pm, r, "l", 60.0, Rgba::rgb(0, 0, 0), TextStyle { italic, ..plain }, 1.0);
+            text_block(&mut pm, r, "l", 60.0, Rgba::rgb(0, 0, 0), TextStyle { face: text::Face { italic, ..plain.face }, ..plain }, 1.0);
             let (.., top, bottom) = text_ink(&pm);
             (top as i32 - bottom as i32, text_height(&pm))
         };
@@ -1405,9 +1493,10 @@ mod tests {
         assert!(upright.abs() <= 1, "upright stem: {upright}");
         assert!((lean as f32 - 0.2126 * height as f32).abs() <= 3.0, "lean {lean} over {height} px");
         // Right-aligned, slanted or tightened past the letters' width, the ink stays in the box.
-        for style in
-            [TextStyle { align: TextAlign::Right, italic: true, ..plain }, TextStyle { align: TextAlign::Right, spacing: -5.0, ..plain }]
-        {
+        for style in [
+            TextStyle { align: TextAlign::Right, face: text::Face { italic: true, ..plain.face }, ..plain },
+            TextStyle { align: TextAlign::Right, spacing: -5.0, ..plain },
+        ] {
             let mut pm = Pixmap::new(400, 60).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
             let r = Rect::from_xywh(0.0, 0.0, 300.0, 60.0).unwrap();

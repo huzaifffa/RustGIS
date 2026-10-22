@@ -58,6 +58,11 @@ impl CommandSpec {
         param_keys(self.params)
     }
 
+    /// Whether the parameter description includes a required top-level input.
+    pub fn needs_input(&self) -> bool {
+        needs_input(self.params)
+    }
+
     pub const fn new(id: &'static str, label: &'static str, location: &'static str, run: fn(&mut Session, &Value) -> CmdResult) -> Self {
         CommandSpec { id, label, location, shortcut: "", params: "{}", mutates: true, enabled: always, run }
     }
@@ -85,6 +90,69 @@ impl CommandSpec {
 /// alternative (after `|`, followed by `?` or `:`, as in `"path": folder | "url": …` or
 /// `"lon" | "x": number`).
 pub fn param_keys(desc: &str) -> Option<Vec<&str>> {
+    let mut keys = Vec::new();
+    param_entries(desc, |key, _| keys.push(key))?;
+    Some(keys)
+}
+
+/// One entry of a parameter description: its key, whether it may be left out, and its text as
+/// written (`"size"?: number`), for help that lists the parameters one per line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Param<'a> {
+    pub key: &'a str,
+    pub optional: bool,
+    pub text: &'a str,
+}
+
+/// The entries of a `{"key": …, "other"?: …}` description, split at its top-level commas (commas
+/// inside quotes, parentheses, brackets or braces belong to an entry's text). The key is an
+/// entry's first quoted word; an entry without one (prose) is left out. None when the
+/// description isn't an object.
+pub fn param_list(desc: &str) -> Option<Vec<Param<'_>>> {
+    // Up to the last brace: a note may follow the object, as in `{"path"?: file} (a style)`.
+    let body = desc.trim().strip_prefix('{')?;
+    let inner = body.get(..body.rfind('}')?)?;
+    let mut out = Vec::new();
+    let (mut depth, mut quoted, mut start, mut escaped) = (0usize, false, 0, false);
+    for (i, c) in inner.char_indices() {
+        // A quote after a backslash (`\"`, in a plugin's description) doesn't open or close one.
+        let was_escaped = escaped;
+        escaped = c == '\\' && !was_escaped;
+        match c {
+            '"' if !was_escaped => quoted = !quoted,
+            '(' | '[' | '{' if !quoted => depth += 1,
+            ')' | ']' | '}' if !quoted => depth = depth.saturating_sub(1),
+            ',' if !quoted && depth == 0 => {
+                out.extend(inner.get(start..i).and_then(param));
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.extend(inner.get(start..).and_then(param));
+    Some(out)
+}
+
+/// An entry of a parameter description (see `param_list`): None for prose without a key.
+fn param(part: &str) -> Option<Param<'_>> {
+    let text = part.trim();
+    let rest = text.strip_prefix('"')?;
+    let (key, after) = rest.split_at(rest.find('"')?);
+    let optional = after.get(1..).is_some_and(|a| a.trim_start().starts_with('?'));
+    Some(Param { key, optional, text })
+}
+
+/// Whether a parameter description has a required key. Question marks in values do not count.
+pub fn needs_input(desc: &str) -> bool {
+    let mut required = false;
+    match param_entries(desc, |_, optional| required |= !optional) {
+        Some(()) => required,
+        None => desc.contains(':'),
+    }
+}
+
+/// Visits top-level keys with their optional flag without allocating while checking requirements.
+fn param_entries<'a>(desc: &'a str, mut visit: impl FnMut(&'a str, bool)) -> Option<()> {
     #[derive(PartialEq)]
     enum At {
         Value,
@@ -95,7 +163,7 @@ pub fn param_keys(desc: &str) -> Option<Vec<&str>> {
     if bytes.iter().find(|c| !c.is_ascii_whitespace()) != Some(&b'{') {
         return None;
     }
-    let (mut keys, mut depth, mut at, mut i) = (Vec::new(), 0usize, At::Value, 0);
+    let (mut depth, mut at, mut i) = (0usize, At::Value, 0);
     while let Some(&c) = bytes.get(i) {
         match c {
             b'"' => {
@@ -106,8 +174,11 @@ pub fn param_keys(desc: &str) -> Option<Vec<&str>> {
                     At::Alternative => matches!(next, Some(b'?' | b':')),
                     At::Value => false,
                 };
-                if depth == 1 && key {
-                    keys.extend(desc.get(i + 1..end));
+                if depth == 1
+                    && key
+                    && let Some(key) = desc.get(i + 1..end)
+                {
+                    visit(key, next == Some(&b'?'));
                 }
                 at = At::Value;
                 i = end;
@@ -127,7 +198,7 @@ pub fn param_keys(desc: &str) -> Option<Vec<&str>> {
         }
         i += 1;
     }
-    Some(keys)
+    Some(())
 }
 
 /// `s` cut to `n` characters, with `…` when cut.
@@ -328,6 +399,7 @@ struct PutAside {
     style_view: Option<(String, Camera)>,
     #[cfg(not(target_arch = "wasm32"))]
     sql_results: Vec<(u64, String, Option<String>, rustgis_data::source::duckdb::Output)>,
+    trend_results: Vec<(u64, Vec<rustgis_data::raster::Raster>, usize)>,
     edit_counts: std::collections::HashMap<u32, cmd::design::EditCounts>,
 }
 
@@ -462,6 +534,9 @@ pub struct Session {
     /// the id, the query and database (label) they came from, and the result.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) sql_results: Vec<(u64, String, Option<String>, rustgis_data::source::duckdb::Output)>,
+    /// Trends the app worked out on a thread, waiting for `cube.trend {"ran"}`: the id, the
+    /// layers and how many dates (see [`cmd::cube::land`]).
+    pub(crate) trend_results: Vec<(u64, Vec<rustgis_data::raster::Raster>, usize)>,
 }
 
 /// The most `layer.addUrl` requests kept for the front end at a time.
@@ -591,6 +666,7 @@ impl Session {
             quiet_failure: false,
             #[cfg(not(target_arch = "wasm32"))]
             sql_results: Vec::new(),
+            trend_results: Vec::new(),
         }
     }
 
@@ -918,6 +994,7 @@ impl Session {
             style_view: self.style_view.take(),
             #[cfg(not(target_arch = "wasm32"))]
             sql_results: take(&mut self.sql_results),
+            trend_results: take(&mut self.trend_results),
             edit_counts: take(&mut self.edit_counts),
         }
     }
@@ -959,6 +1036,7 @@ impl Session {
             style_view,
             #[cfg(not(target_arch = "wasm32"))]
             sql_results,
+            trend_results,
             edit_counts,
         } = *a;
         (self.undo, self.redo, self.back, self.forward, self.last_camera) = (undo, redo, back, forward, last_camera);
@@ -970,6 +1048,7 @@ impl Session {
         (self.path, self.model_run, self.style_view) = (path, model_run, style_view);
         (self.pending, self.plugin_runs, self.plugin_retries) = (pending, plugin_runs, plugin_retries);
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
+        self.trend_results = trend_results;
         #[cfg(feature = "geolibre")]
         {
             self.started = started;
@@ -1072,6 +1151,8 @@ impl Session {
                 m.apply_time();
             }
         }
+        // Zarr layers that follow the slider read the step it is back at.
+        cmd::zarr::follow_time(self);
     }
 
     fn open_layout_name(&self) -> Option<String> {

@@ -7,7 +7,7 @@ use egui::{Align2, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::Session;
 use rustgis_engine::analysis::{ParamKind, tools};
 use rustgis_engine::data::GeometryType;
-use rustgis_engine::map::raster::{RasterLegend, RasterStyle};
+use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle};
 use rustgis_engine::map::symbology::{
     ClassRef, ClassStyle, LineCap, LineJoin, LineStroke, MAX_LABEL, MAX_STROKE_OFFSET, MAX_STROKE_WIDTH, MAX_STROKES, MAX_UNIQUE,
     normalize_label,
@@ -41,6 +41,17 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
             }
             ui.advance_cursor_after_rect(rect);
         });
+    }
+    // A point picked for the Time Series pane is taken only while that pane shows: with it
+    // closed or another in view, the pick ends rather than waiting with a stale click.
+    if app.ui.right != Some(RightPane::TimeSeries) && app.workflow.pick.as_ref().is_some_and(|p| p.purpose == "ts_point") {
+        app.workflow.pick = None;
+    }
+    // A Zarr summary or a trend running on its thread lands whatever pane is in view (both are
+    // looked at: `|`, not `||`), and the frames go on while one runs so it's taken when it ends.
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::workspacepanes::land_summary(app) | crate::analysispane::land_trend(app) {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
     }
     // The pane in view always has its tab, however it was set.
     if let Some(right) = app.ui.right
@@ -100,6 +111,7 @@ fn right_title(pane: RightPane) -> (&'static str, &'static str) {
         RightPane::Tasks => ("Tasks", "ui.pane.tasks"),
         RightPane::Jobs => ("Workflow Manager", "ui.pane.jobs"),
         RightPane::Profile => ("Profile", "ui.pane.profile"),
+        RightPane::TimeSeries => ("Time Series", "ui.pane.timeSeries"),
         RightPane::Diagnostics => ("Diagnostic Monitor", "ui.pane.diagnostics"),
         RightPane::Infographics => ("Infographics", "ui.pane.infographics"),
         RightPane::Report => ("Report", "ui.pane.report"),
@@ -140,6 +152,11 @@ fn right_pane(app: &mut RustGisApp, ui: &mut Ui, right: RightPane, t: &Tokens) {
         crate::sqlpane::show(app, ui, t);
         return;
     }
+    // The Script pane fits its box to the pane's height, the buttons kept in view (#653).
+    if right == RightPane::Script {
+        crate::analysispane::script_pane(app, ui, t);
+        return;
+    }
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| match right {
             RightPane::Geoprocessing => geoprocessing(app, ui, t),
@@ -149,16 +166,16 @@ fn right_pane(app: &mut RustGisApp, ui: &mut Ui, right: RightPane, t: &Tokens) {
             RightPane::Editing => crate::editpanes::editing(app, ui, t),
             RightPane::Design => crate::editpanes::design(app, ui, t),
             RightPane::Workflows => crate::analysispane::workflows(app, ui, t),
-            RightPane::Script => crate::analysispane::script(app, ui, t),
             RightPane::Tasks => crate::workspacepanes::tasks(app, ui, t),
             RightPane::Jobs => crate::workspacepanes::jobs(app, ui, t),
             RightPane::Profile => crate::workspacepanes::profile(app, ui, t),
+            RightPane::TimeSeries => crate::workspacepanes::time_series(app, ui, t),
             RightPane::Diagnostics => crate::workspacepanes::diagnostics(app, ui, t),
             RightPane::Infographics => crate::workspacepanes::infographics(app, ui, t),
             RightPane::Report => crate::reportpane::report(app, ui, t),
             RightPane::Presentation => crate::docpanes::presentation(app, ui, t),
             RightPane::Notebook => crate::docpanes::notebook(app, ui, t),
-            RightPane::Assistant | RightPane::Sql => {}
+            RightPane::Assistant | RightPane::Sql | RightPane::Script => {}
             RightPane::Shares => crate::docpanes::shares(app, ui, t),
             RightPane::Directions => crate::navui::show(app, ui, t),
             RightPane::Bookmarks => crate::bookmarkpane::show(app, ui, t),
@@ -3442,20 +3459,35 @@ fn legend_list(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     p
                 };
                 ui.horizontal(|ui| {
-                    // A polygon class keeps its own transparency when recoloured (`with_fill`), so
-                    // its picker is colour only: no alpha, no blending, and a solid button. Points
-                    // and lines take the colour's alpha, so theirs has it.
-                    let picked = if l.geometry_type() == GeometryType::Polygon {
-                        let f = e.symbol.fill;
-                        let mut rgb = [f.r(), f.g(), f.b()];
-                        let r = ui.color_edit_button_srgb(&mut rgb).on_hover_text(tl!("Class color"));
-                        r.changed().then(|| rustgis_engine::map::Rgba::rgb(rgb[0], rgb[1], rgb[2]))
-                    } else {
-                        let mut c = c32(e.symbol.fill);
-                        crate::widgets::color_button(ui, &mut c).on_hover_text(tl!("Class color")).changed().then(|| rgba(c))
-                    };
+                    // Construct hue independently of alpha: Color32 discards hidden RGB at zero.
+                    let fill = e.symbol.fill;
+                    let mut hsva = egui::ecolor::Hsva::from_srgb([fill.r(), fill.g(), fill.b()]);
+                    hsva.a = f32::from(fill.a()) / 255.0;
+                    let alpha = hsva.a;
+                    // egui creates the popup from the context, not this Ui's scoped style.
+                    // Borrow linear numeric editing only while a transparent picker is open.
+                    let styles = (fill.a() == 0 && egui::Popup::is_any_open(ui.ctx()))
+                        .then(|| [egui::Theme::Light, egui::Theme::Dark].map(|theme| (theme, ui.ctx().style_of(theme))));
+                    if styles.is_some() {
+                        ui.ctx().global_style_mut(|style| style.visuals.numeric_color_space = egui::style::NumericColorSpace::Linear);
+                    }
+                    let response = egui::color_picker::color_edit_button_hsva(ui, &mut hsva, egui::color_picker::Alpha::OnlyBlend);
+                    if let Some(styles) = styles {
+                        // The popup's numeric-mode button can change both themes; restore both
+                        // immediately so no other picker or later frame inherits the override.
+                        for (theme, style) in styles {
+                            ui.ctx().set_style_of(theme, style);
+                        }
+                    }
+                    let picked = response.on_hover_text(tl!("Class color")).changed().then(|| {
+                        let edited = rustgis_engine::map::Rgba(hsva.to_srgba_unmultiplied());
+                        // The numeric alpha editor also rounds RGB through Color32; an
+                        // opacity-only edit must keep the class's original channels exactly.
+                        if hsva.a != alpha { fill.with_alpha(edited.a()) } else { edited }
+                    });
                     if let Some(color) = picked {
-                        let params = with("color", json!(color.hex()));
+                        // Keep FF too: six-digit polygon colours deliberately preserve translucency.
+                        let params = with("color", json!(color.hex8()));
                         let key = egui::Id::new(CLASS_COLOR_DRAG);
                         let mut dragging = ui.data(|d| d.get_temp::<ClassColorDrag>(key));
                         // One left pending on another layer (the pane switched layers mid-drag) is
@@ -4007,6 +4039,42 @@ fn raster_details(ui: &mut Ui, rl: &rustgis_engine::map::RasterLayer, t: &Tokens
     });
 }
 
+/// A Min and Max for each colour channel of an RGB layer: a stretch to the bands' own minimum and
+/// maximum or to bounds of your own, which an edit turns it into. Edits are kept here until every
+/// pair is valid, so the layer's values don't snap back.
+fn rgb_stretch_bounds(app: &mut RustGisApp, ui: &mut Ui, layer: impl std::hash::Hash + std::fmt::Debug, t: &Tokens, shown: [[f64; 2]; 3]) {
+    type Bounds = [[f64; 2]; 3];
+    let key = ui.id().with(("custom_stretch_rgb", layer));
+    let pending = ui.data(|d| d.get_temp::<(Bounds, Bounds)>(key)).filter(|(base, _)| *base == shown);
+    let mut edit = pending.map_or(shown, |(_, e)| e);
+    let (mut done, mut changed) = (false, false);
+    for (name, pair) in [tl!("Red"), tl!("Green"), tl!("Blue")].into_iter().zip(edit.iter_mut()) {
+        let [mut lo, mut hi] = *pair;
+        let speed = ((hi - lo).abs() / 200.0).clamp(1e-6, 1e6);
+        ui.horizontal(|ui| {
+            ui.add_sized([44.0, 18.0], egui::Label::new(name));
+            ui.label(tl!("Min"));
+            let a = ui.add(egui::DragValue::new(&mut lo).speed(speed));
+            ui.label(tl!("Max"));
+            let b = ui.add(egui::DragValue::new(&mut hi).speed(speed));
+            done |= a.drag_stopped() || b.drag_stopped() || ((a.changed() || b.changed()) && !a.dragged() && !b.dragged());
+            changed |= a.changed() || b.changed();
+        });
+        if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+            ui.label(egui::RichText::new(tl!("Min must be less than Max")).size(11.5).color(t.red));
+        }
+        *pair = [lo, hi];
+    }
+    let valid = edit.iter().all(|[lo, hi]| lo.is_finite() && hi.is_finite() && lo < hi);
+    if valid && done && edit != shown {
+        ui.data_mut(|d| d.remove::<(Bounds, Bounds)>(key));
+        let col = |i: usize| edit.map(|p| p[i]);
+        let _ = app.run("raster.stretch", json!({"type": "custom", "min": col(0), "max": col(1)}));
+    } else if changed {
+        ui.data_mut(|d| d.insert_temp(key, (shown, edit)));
+    }
+}
+
 fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
     ui.label(egui::RichText::new(&l.name).font(semibold(14.0)));
     let Some(rl) = l.raster.clone() else { return };
@@ -4213,7 +4281,19 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     }
                 });
             }
-            Stretch::Custom { min, max } => {
+            Stretch::Custom { .. } | Stretch::MinMax if matches!(style.renderer, RasterRenderer::Rgb { .. }) => {
+                let masked = rl.masked_stats();
+                let shown: [[f64; 2]; 3] = std::array::from_fn(|i| {
+                    let band = style.renderer.bands().get(i).copied().unwrap_or(0);
+                    let stats = masked.as_ref().and_then(|m| m.get(i)).or_else(|| d.bands.get(band).map(|b| &b.stats));
+                    stats.map_or([0.0, 1.0], |st| {
+                        let n = Normalizer::for_channel(style.stretch, i, st, &d.data_type);
+                        [n.lo, n.hi]
+                    })
+                });
+                rgb_stretch_bounds(app, ui, l.id, t, shown);
+            }
+            Stretch::Custom { min, max, .. } => {
                 // Edits are kept here until both bounds are valid, so the layer's values don't snap back.
                 // They remember the layer's bounds they started from, and go stale when those change.
                 let key = ui.id().with(("custom_stretch", l.id));
@@ -4607,6 +4687,123 @@ mod tests {
         assert_eq!(transparency(&h), mid, "letting go keeps the value");
         h.state_mut().run("edit.undo", Value::Null).unwrap();
         assert_eq!(transparency(&h), start, "one undo takes the whole drag back");
+    }
+
+    /// Editing opacity must not turn a transparent red or a near-transparent colour into black.
+    /// Exercise the real class picker and command, including one-step undo after the edit.
+    #[test]
+    fn class_opacity_edits_keep_unmultiplied_rgb() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role};
+        use egui_kittest::kittest::{NodeT, Queryable};
+        use rustgis_engine::map::Rgba;
+
+        for original in [Rgba::new(255, 0, 0, 0), Rgba::new(47, 162, 214, 1)] {
+            let mut app = RustGisApp::with_sample();
+            app.run("layer.symbology", json!({"layer": "Countries", "type": "graduated", "field": "pop_est", "classes": 1})).unwrap();
+            app.run("layer.classStyle", json!({"layer": "Countries", "index": 0, "color": original.hex8()})).unwrap();
+            let id = layer(&app, "Countries");
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 600.0)).with_max_steps(64).build_ui_state(
+                move |ui, app: &mut RustGisApp| {
+                    finish_class_color_drag(app, ui);
+                    let layer = app.session.map().layer(id).unwrap().clone();
+                    legend_list(app, ui, &layer, &Tokens::light());
+                },
+                app,
+            );
+            h.run_steps(3);
+            let fill =
+                |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer(id).unwrap().renderer.legend()[0].symbol.fill;
+            assert_eq!(fill(&h), original, "displaying the picker must not change the class");
+            h.get_by_role(Role::ColorWell).click();
+            h.run_steps(3);
+            for alpha in [255, 0, 128] {
+                let before = h.state().session.undo_depth();
+                let previous = fill(&h);
+                // The popup's RGBA editors are its four spin buttons, with alpha last.
+                let (node, tree) = h.query_all_by_role(Role::SpinButton).last().unwrap().accesskit_node().locate();
+                h.event(egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::SetValue,
+                    target_tree: tree,
+                    target_node: node,
+                    data: Some(ActionData::NumericValue(if previous.a() == 0 { f64::from(alpha) / 255.0 } else { f64::from(alpha) })),
+                }));
+                h.run_steps(3);
+                assert_eq!(fill(&h), original.with_alpha(alpha), "opacity edits must retain the original RGB");
+                assert_eq!(h.state().session.undo_depth(), before + 1);
+                h.state_mut().run("edit.undo", Value::Null).unwrap();
+                assert_eq!(fill(&h), previous, "one undo restores the previous colour and opacity");
+                h.state_mut().run("edit.redo", Value::Null).unwrap();
+                assert_eq!(fill(&h), original.with_alpha(alpha));
+                // Closing and reopening must reconstruct the same hidden colour, even at zero.
+                h.key_press(egui::Key::Escape);
+                h.run_steps(3);
+                h.get_by_role(Role::ColorWell).click();
+                h.run_steps(3);
+            }
+        }
+    }
+
+    /// Numeric RGB edits at alpha zero keep the newly selected colour, not transparent black
+    /// or the previous RGB. Reopening and raising opacity must reveal that selection.
+    #[test]
+    fn transparent_class_numeric_rgb_edits_survive_reopening() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role};
+        use egui_kittest::kittest::{NodeT, Queryable};
+        use rustgis_engine::map::Rgba;
+
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.symbology", json!({"layer": "Countries", "type": "graduated", "field": "pop_est", "classes": 1})).unwrap();
+        app.run("layer.classStyle", json!({"layer": "Countries", "index": 0, "color": "#FF000000"})).unwrap();
+        let id = layer(&app, "Countries");
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 600.0)).with_max_steps(64).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                finish_class_color_drag(app, ui);
+                let layer = app.session.map().layer(id).unwrap().clone();
+                legend_list(app, ui, &layer, &Tokens::light());
+            },
+            app,
+        );
+        h.run_steps(3);
+        let fill = |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer(id).unwrap().renderer.legend()[0].symbol.fill;
+        let inactive_theme = match h.ctx.theme() {
+            egui::Theme::Light => egui::Theme::Dark,
+            egui::Theme::Dark => egui::Theme::Light,
+        };
+        h.ctx.style_mut_of(inactive_theme, |style| style.visuals.numeric_color_space = egui::style::NumericColorSpace::Linear);
+        let styles = [egui::Theme::Light, egui::Theme::Dark].map(|theme| h.ctx.style_of(theme).visuals.numeric_color_space);
+        h.get_by_role(Role::ColorWell).click();
+        h.run_steps(3);
+        // Fully transparent fills use linear 0..1 numeric controls: green 1 makes yellow.
+        let edit = |h: &mut egui_kittest::Harness<'_, RustGisApp>, channel, value| {
+            let (node, tree) = h.query_all_by_role(Role::SpinButton).nth(channel).unwrap().accesskit_node().locate();
+            h.event(egui::Event::AccessKitActionRequest(ActionRequest {
+                action: Action::SetValue,
+                target_tree: tree,
+                target_node: node,
+                data: Some(ActionData::NumericValue(value)),
+            }));
+            h.run_steps(3);
+        };
+        edit(&mut h, 1, 1.0);
+        assert_eq!(fill(&h), Rgba::new(255, 255, 0, 0));
+        // Even the popup's mode toggle must not leak changes into either theme.
+        h.get_by_role_and_label(Role::Button, "F").click();
+        h.run_steps(3);
+        assert_eq!([egui::Theme::Light, egui::Theme::Dark].map(|theme| h.ctx.style_of(theme).visuals.numeric_color_space), styles);
+        h.state_mut().run("edit.undo", Value::Null).unwrap();
+        assert_eq!(fill(&h), Rgba::new(255, 0, 0, 0));
+        h.state_mut().run("edit.redo", Value::Null).unwrap();
+        assert_eq!(fill(&h), Rgba::new(255, 255, 0, 0));
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        h.get_by_role(Role::ColorWell).click();
+        h.run_steps(3);
+        edit(&mut h, 3, 1.0);
+        assert_eq!(fill(&h), Rgba::new(255, 255, 0, 255));
+        // Opaque colours retain the ordinary byte-based editor.
+        edit(&mut h, 1, 64.0);
+        assert_eq!(fill(&h), Rgba::new(255, 64, 0, 255));
+        assert_eq!([egui::Theme::Light, egui::Theme::Dark].map(|theme| h.ctx.style_of(theme).visuals.numeric_color_space), styles);
     }
 
     /// The layer menu selects its layer as it opens, not on every frame it stays open: each

@@ -43,6 +43,26 @@ pub fn is_raster_name(name: &str) -> bool {
     READ_EXTENSIONS.contains(&ext.as_str())
 }
 
+/// Whether a file name is JPEG 2000's (`.jp2`, `.j2k`): read through GDAL on the desktop, from a
+/// download too (`gdal::convert_jpeg2000`).
+pub fn is_jpeg2000_name(name: &str) -> bool {
+    let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "jp2" | "j2k")
+}
+
+/// The extension of JPEG 2000 contents, from their first bytes: `jp2` for a JP2 file's signature
+/// box, `j2k` for a bare codestream's first markers (SOC, SIZ). `None` for anything else. The
+/// bytes alone decide, so a download without a file name can be told apart on every platform.
+pub fn jpeg2000_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\0\0\0\x0cjP  \r\n\x87\n") {
+        Some("jp2")
+    } else if bytes.starts_with(&[0xff, 0x4f, 0xff, 0x51]) {
+        Some("j2k")
+    } else {
+        None
+    }
+}
+
 /// Maps pixel (column, row) corners to coordinates: north-up grids only.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GeoTransform {

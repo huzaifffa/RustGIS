@@ -33,7 +33,43 @@ pub struct Workflow {
     pub error: Option<String>,
     pub script: String,
     pub script_out: Vec<(String, bool)>,
+    pub trend: TrendForm,
 }
+
+/// The Trend Analysis section's inputs (#579), and a run under way.
+#[derive(Default)]
+pub struct TrendForm {
+    /// The cube: a stack of layers (`true`), or one layer (a Zarr variable, or a raster of bands).
+    pub stack: bool,
+    /// The layers ticked for a stack.
+    pub ticked: Vec<String>,
+    pub test: String,
+    pub seasons: u32,
+    pub alpha: String,
+    pub decade: bool,
+    pub start: String,
+    pub end: String,
+    pub months: String,
+    pub min_valid: String,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub running: Option<Trending>,
+}
+
+/// A trend running on a thread of its own: Cancel, the work done, and the result.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct Trending {
+    pub total: usize,
+    /// Its place among the project's work under way: a trend that lands after another project
+    /// opened is dropped.
+    pub id: u64,
+    pub params: Value,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub result: TrendResult,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type TrendResult = std::sync::Arc<std::sync::Mutex<Option<Result<(Vec<rustgis_engine::data::raster::Raster>, usize), String>>>>;
 
 fn heading(ui: &mut Ui, text: &str) {
     ui.add_space(6.0);
@@ -86,6 +122,7 @@ pub const SECTIONS: &[(&str, &str)] = &[
     ("models", "ModelBuilder"),
     ("georeference", "Georeference"),
     ("change", "Change Detection"),
+    ("trend", "Trend Analysis"),
     ("spectral", "Spectral Analysis"),
     ("classify", "Classification Wizard"),
     ("supervised", "Classification Tools"),
@@ -148,16 +185,18 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     };
     let numeric = fields_of(&app.workflow.layer, true);
     let w = &mut app.workflow;
-    if w.layer.is_empty() || !(rasters.contains(&w.layer) || features.contains(&w.layer)) {
-        w.layer = match w.section {
-            "rasterFunctions" | "functionEditor" | "suitability" | "visibility" | "lineOfSight" => {
-                rasters.first().cloned().unwrap_or_default()
-            }
-            "interpolate" => points.first().cloned().unwrap_or_default(),
-            "network" => lines.first().cloned().unwrap_or_default(),
-            "simulation" => polygons.first().cloned().unwrap_or_default(),
-            _ => features.first().cloned().unwrap_or_default(),
-        };
+    let inputs = match w.section {
+        "rasterFunctions" | "functionEditor" | "suitability" | "visibility" | "lineOfSight" | "georeference" | "change" | "spectral"
+        | "classify" | "supervised" | "deepLearning" | "hosted" | "indices" | "process" | "pixels" | "mensuration" | "reality"
+        // The trend's one-layer mode takes a raster (a Zarr variable, or a raster of several bands).
+        | "trend" => &rasters,
+        "interpolate" => &points,
+        "network" => &lines,
+        "simulation" => &polygons,
+        _ => &features,
+    };
+    if !inputs.contains(&w.layer) {
+        w.layer = inputs.first().cloned().unwrap_or_default();
     }
     ui.add_space(6.0);
     match app.workflow.section {
@@ -461,6 +500,7 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 );
             }
         }
+        "trend" => trend(app, ui, &rasters),
         "spectral" => {
             heading(ui, "Band values at a point");
             combo(ui, "wf_sp", &mut app.workflow.layer, &rasters);
@@ -720,6 +760,236 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     }
 }
 
+/// The Trend Analysis section (opengeos/RustGIS#579): a cube (raster layers a date each, a Zarr
+/// variable, or a raster's bands), Sen's slope and the modified Mann–Kendall test, worked out on a
+/// thread with progress and Cancel, and added as four layers.
+fn trend(app: &mut RustGisApp, ui: &mut Ui, rasters: &[String]) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if trend_running(app, ui) {
+        return;
+    }
+    heading(ui, "Trend over a series of rasters");
+    let f = &mut app.workflow.trend;
+    if f.test.is_empty() {
+        (f.test, f.seasons, f.alpha) = ("hamedRao".into(), 12, "0.05".into());
+    }
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut f.stack, true, tl!("Layers, a date each"));
+        ui.radio_value(&mut f.stack, false, tl!("One layer: a Zarr variable or a raster's bands"));
+    });
+    if f.stack {
+        f.ticked.retain(|n| rasters.contains(n));
+        ui.horizontal(|ui| {
+            if ui.small_button(tl!("All")).clicked() {
+                f.ticked = rasters.to_vec();
+            }
+            if ui.small_button(tl!("None")).clicked() {
+                f.ticked.clear();
+            }
+        });
+        egui::ScrollArea::vertical().id_salt("trend_layers").max_height(160.0).show(ui, |ui| {
+            for n in rasters {
+                let mut on = f.ticked.contains(n);
+                let date = rustgis_engine::cmd::cube::date_in_text(n)
+                    .map_or_else(|| tl!("no date in the name").to_string(), |d| rustgis_engine::data::time::format(d, "YYYY-MM-DD"));
+                if ui.checkbox(&mut on, format!("{n}  ({date})")).changed() {
+                    if on {
+                        f.ticked.push(n.clone());
+                    } else {
+                        f.ticked.retain(|x| x != n);
+                    }
+                }
+            }
+        });
+    } else {
+        combo(ui, "wf_tr_layer", &mut app.workflow.layer, rasters);
+    }
+    let f = &mut app.workflow.trend;
+    egui::Grid::new("trend_grid").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+        ui.label(tl!("Test"));
+        let tests = [
+            ("hamedRao", "Modified Mann–Kendall (Hamed & Rao)"),
+            ("yueWang", "Modified Mann–Kendall (Yue & Wang)"),
+            ("seasonal", "Seasonal Mann–Kendall"),
+            ("original", "Mann–Kendall"),
+        ];
+        let shown = tests.iter().find(|t| t.0 == f.test).map_or("", |t| t.1);
+        egui::ComboBox::from_id_salt("trend_test").selected_text(tl!(shown)).width(240.0).show_ui(ui, |ui| {
+            for (code, label) in tests {
+                ui.selectable_value(&mut f.test, code.to_string(), tl!(label));
+            }
+        });
+        ui.end_row();
+        if f.test == "seasonal" {
+            ui.label(tl!("Seasons a year"));
+            ui.add(egui::DragValue::new(&mut f.seasons).range(2..=366));
+            ui.end_row();
+        }
+        ui.label(tl!("Significance level"));
+        ui.add(egui::TextEdit::singleline(&mut f.alpha).desired_width(60.0));
+        ui.end_row();
+        ui.label(tl!("Slope per"));
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut f.decade, false, tl!("year"));
+            ui.radio_value(&mut f.decade, true, tl!("decade"));
+        });
+        ui.end_row();
+        ui.label(tl!("From"));
+        ui.add(egui::TextEdit::singleline(&mut f.start).hint_text("2000-01-01").desired_width(110.0));
+        ui.end_row();
+        ui.label(tl!("To"));
+        ui.add(egui::TextEdit::singleline(&mut f.end).hint_text("2024-12-31").desired_width(110.0));
+        ui.end_row();
+        ui.label(tl!("Months"));
+        ui.add(egui::TextEdit::singleline(&mut f.months).hint_text("12, 1, 2").desired_width(110.0));
+        ui.end_row();
+        ui.label(tl!("Dates a cell needs"));
+        ui.add(egui::TextEdit::singleline(&mut f.min_valid).hint_text(tl!("half")).desired_width(60.0));
+        ui.end_row();
+    });
+    ui.label(
+        egui::RichText::new(tl!("Writes Sen's slope, the test's Z and p-value, and the slope where the trend is significant."))
+            .weak()
+            .small(),
+    );
+    if !ui.button(tl!("Run")).clicked() {
+        return;
+    }
+    let mut p = json!({"test": f.test, "per": if f.decade { "decade" } else { "year" }});
+    if f.stack {
+        p["layers"] = json!(f.ticked);
+    } else {
+        p["layer"] = json!(app.workflow.layer);
+    }
+    if f.test == "seasonal" {
+        p["seasons"] = json!(f.seasons);
+    }
+    // A field filled in but not read as a number is said, never dropped for the default.
+    let mut bad: Option<String> = None;
+    match f.alpha.trim() {
+        "" => {}
+        a => match a.parse::<f64>() {
+            Ok(a) => p["alpha"] = json!(a),
+            Err(_) => bad = Some(tl!("The significance level is a number, such as 0.05").to_string()),
+        },
+    }
+    match f.min_valid.trim() {
+        "" => {}
+        m => match m.parse::<u64>() {
+            Ok(m) => p["minValid"] = json!(m),
+            Err(_) => bad = Some(tl!("Dates a cell needs is a whole number, or empty for half").to_string()),
+        },
+    }
+    for (k, v) in [("start", &f.start), ("end", &f.end)] {
+        if !v.trim().is_empty() {
+            p[k] = json!(v.trim());
+        }
+    }
+    let typed: Vec<&str> = f.months.split([',', ' ']).map(str::trim).filter(|m| !m.is_empty()).collect();
+    let months: Vec<Value> = typed.iter().filter_map(|m| m.parse::<u64>().ok()).map(|m| json!(m)).collect();
+    if months.len() != typed.len() {
+        bad = Some(tl!("Months are numbers from 1 to 12 (12, 1, 2 for December to February)").to_string());
+    }
+    if let Some(e) = bad {
+        app.workflow.error = Some(e);
+        return;
+    }
+    if !months.is_empty() {
+        p["months"] = Value::Array(months);
+    }
+    // The web app has no threads: the run is made here.
+    #[cfg(target_arch = "wasm32")]
+    run(app, "cube.trend", p);
+    #[cfg(not(target_arch = "wasm32"))]
+    match rustgis_engine::cmd::cube::trend_start(&app.session, &p) {
+        Ok(job) => {
+            let id = app.session.download_started();
+            let r = Trending {
+                total: job.total(),
+                id,
+                params: p,
+                cancel: Default::default(),
+                done: Default::default(),
+                result: Default::default(),
+            };
+            let (cancel, done, result) = (r.cancel.clone(), r.done.clone(), r.result.clone());
+            // A panic on the thread (a hostile store) lands as an error, so the run always ends;
+            // a thread the system can't start is said.
+            let spawned = std::thread::Builder::new().name("trend".into()).spawn(move || {
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    job.run(&cancel, &done).map(|rasters| (rasters, job.dates()))
+                }))
+                .unwrap_or_else(|_| Err(tl!("The trend failed unexpectedly").to_string()));
+                if let Ok(mut g) = result.lock() {
+                    *g = Some(out);
+                }
+            });
+            match spawned {
+                Ok(_) => {
+                    app.workflow.trend.running = Some(r);
+                    app.workflow.error = None;
+                }
+                Err(e) => {
+                    app.session.download_failed(id);
+                    app.workflow.error = Some(crate::i18n::fmt("The trend couldn't start: {error}", &[("error", &e.to_string())]));
+                }
+            }
+        }
+        Err(e) => app.workflow.error = Some(e),
+    }
+}
+
+/// A trend that has finished, its layers added through `cube.trend` (so it's in the History):
+/// called every frame, whatever pane is in view, so a run lands though the Workflows pane
+/// closed. `true` while one is still running.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn land_trend(app: &mut RustGisApp) -> bool {
+    use std::sync::atomic::Ordering;
+    let Some(r) = &app.workflow.trend.running else { return false };
+    let Some(res) = r.result.lock().ok().and_then(|mut g| g.take()) else { return true };
+    let mut p = r.params.clone();
+    // A run the user cancelled stops quietly: no error for it.
+    let cancelled = r.cancel.load(Ordering::Relaxed);
+    // Still the project it was run in (`false` once another opened).
+    let current = app.session.download_done(r.id);
+    app.workflow.trend.running = None;
+    match res {
+        // Cancelled as it finished: nothing added.
+        Ok(_) if cancelled => {}
+        // Another project opened meanwhile: nothing added, and said.
+        Ok(_) if !current => {
+            app.workflow.error = Some(tl!("The trend finished after another project was opened, so it wasn't added").to_string());
+        }
+        Ok((rasters, dates)) => {
+            p["ran"] = json!(rustgis_engine::cmd::cube::land(&mut app.session, rasters, dates));
+            run(app, "cube.trend", p);
+        }
+        Err(_) if cancelled => {}
+        Err(e) => app.workflow.error = Some(e),
+    }
+    false
+}
+
+/// A trend under way: its progress and Cancel (its result lands through `land_trend`). Whether
+/// one is still running.
+#[cfg(not(target_arch = "wasm32"))]
+fn trend_running(app: &mut RustGisApp, ui: &mut Ui) -> bool {
+    use std::sync::atomic::Ordering;
+    if !land_trend(app) {
+        return false;
+    }
+    let Some(r) = &app.workflow.trend.running else { return false };
+    let (done, total) = (r.done.load(Ordering::Relaxed), r.total.max(1));
+    heading(ui, "Trend over a series of rasters");
+    ui.horizontal(|ui| {
+        ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(format!("{done} / {total}")).desired_width(200.0));
+        if ui.button(tl!("Cancel")).clicked() {
+            r.cancel.store(true, Ordering::Relaxed);
+        }
+    });
+    true
+}
+
 /// Shows a workflow's result: profiles and histograms as tables and bars, the rest as JSON.
 fn result_view(ui: &mut Ui, r: &Value, t: &Tokens) {
     ui.add_space(8.0);
@@ -766,16 +1036,87 @@ fn result_view(ui: &mut Ui, r: &Value, t: &Tokens) {
     ui.label(egui::RichText::new(short).monospace().small());
 }
 
-/// The Script pane: commands typed one per line, run in order.
-pub fn script(app: &mut RustGisApp, ui: &mut Ui, _t: &Tokens) {
+/// The lines the Script pane's box starts with; the fewest it keeps when the pane is short.
+const SCRIPT_MIN_ROWS: usize = 10;
+/// The most lines a run's results take below the Script pane's buttons; more scroll there.
+const SCRIPT_OUT_ROWS: f32 = 6.0;
+
+/// The Script pane, laid out to the pane's own height, out of the right pane's scroll (as the SQL
+/// and Assistant panes are): the box grows with the script down to the buttons and then scrolls
+/// inside, so Run and a run's results stay in view, and its height doesn't follow a scroll of the
+/// pane. Only a pane too short for the box's first lines and the buttons scrolls as a whole.
+pub fn script_pane(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
+        // The hint above the box (two lines, in a narrow pane), the box's first lines, the rest.
+        let hint = (ui.text_style_height(&egui::TextStyle::Small) + ui.spacing().item_spacing.y) * 2.0;
+        let need = hint + script_rows(ui) + script_below(app, ui);
+        if ui.available_height() >= need {
+            script(app, ui, t, true);
+        } else {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| script(app, ui, t, false));
+        }
+    });
+}
+
+/// The height of the Script box's first lines.
+fn script_rows(ui: &Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Monospace) * SCRIPT_MIN_ROWS as f32
+}
+
+/// The height the Script pane needs below its box: the buttons, and a run's results (their own
+/// scroll, at most SCRIPT_OUT_ROWS lines) when there are any.
+fn script_below(app: &RustGisApp, ui: &Ui) -> f32 {
+    let gap = ui.spacing().item_spacing.y;
+    let results = if app.workflow.script_out.is_empty() { 0.0 } else { script_out_height(ui) + gap };
+    ui.spacing().interact_size.y + gap * 3.0 + results
+}
+
+/// The most height a run's results take.
+fn script_out_height(ui: &Ui) -> f32 {
+    (ui.text_style_height(&egui::TextStyle::Small) + ui.spacing().item_spacing.y) * SCRIPT_OUT_ROWS
+}
+
+/// The Script pane's content: commands typed one per line, run in order, coloured as they're typed
+/// (#653). `fit`: the box grows down to the buttons (the pane's own layout); else it keeps its
+/// first lines, in a pane that scrolls as a whole.
+fn script(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, fit: bool) {
     ui.label(egui::RichText::new(tl!("One command per line: id {json}. Lines starting with # are comments.")).small().weak());
-    ui.add(
+    let unknown = crate::scriptcolor::unknown_ids_cached(ui, &app.session, &app.workflow.script);
+    let palette = crate::scriptcolor::Palette::of(t);
+    let mut layouter =
+        |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| crate::scriptcolor::layout(ui, buf.as_str(), &unknown, palette, wrap);
+    // The box grows with the script down to what the buttons and results leave (the pane's own
+    // layout: `available_height` is what's left of the pane), then scrolls inside it.
+    let min = script_rows(ui);
+    let room = if fit { (ui.available_height() - script_below(app, ui)).max(min) } else { min };
+    let out_h = script_out_height(ui);
+    // One id whether the pane scrolls as a whole or not, so resizing it across that keeps the
+    // box's focus, cursor and selection.
+    let box_id = egui::Id::new("script_text");
+    // The suggestion list's keys (#662), taken before the box sees them.
+    if let Some((offer, item)) = crate::scriptcomplete::keys(ui, box_id, &app.workflow.script) {
+        crate::scriptcomplete::accept(ui, box_id, &mut app.workflow.script, &offer, &item, &app.session);
+    }
+    // `{` closing itself (#662): what the box does with the keys, followed through after it.
+    let before = crate::scriptcomplete::before(ui, box_id, &app.workflow.script);
+    let out = egui::ScrollArea::vertical().id_salt("script_box").max_height(room).auto_shrink([false, true]).show(ui, |ui| {
         egui::TextEdit::multiline(&mut app.workflow.script)
+            .id(box_id)
             .code_editor()
-            .desired_rows(10)
+            .event_filter(crate::scriptcomplete::filter(ui, box_id))
+            .layouter(&mut layouter)
+            .desired_rows(SCRIPT_MIN_ROWS)
             .desired_width(f32::INFINITY)
-            .hint_text("map.goToXY {\"lon\": 2.35, \"lat\": 48.85, \"scale\": 5000000}\nselect.byAttributes {\"layer\": \"Cities\", \"where\": \"pop_max > 1000000\"}"),
-    );
+            .hint_text("map.goToXY {\"lon\": 2.35, \"lat\": 48.85, \"scale\": 5000000}\nselect.byAttributes {\"layer\": \"Cities\", \"where\": \"pop_max > 1000000\"}")
+            .show(ui)
+    });
+    let clicked = crate::scriptcomplete::show(ui, box_id, &out.inner, out.inner_rect, &app.workflow.script, &app.session);
+    crate::scriptcomplete::hint(ui, box_id, &out.inner, out.inner_rect, &app.workflow.script, &app.session);
+    if let Some((offer, item)) = clicked {
+        crate::scriptcomplete::accept(ui, box_id, &mut app.workflow.script, &offer, &item, &app.session);
+    } else {
+        crate::scriptcomplete::braces(ui, before, &out.inner, &mut app.workflow.script);
+    }
     ui.horizontal(|ui| {
         if ui.button(tl!("Run")).clicked() {
             let script = app.workflow.script.clone();
@@ -793,8 +1134,11 @@ pub fn script(app: &mut RustGisApp, ui: &mut Ui, _t: &Tokens) {
             let _ = app.run("ui.commandSearch", Value::Null);
         }
     });
-    for (line, err) in &app.workflow.script_out {
-        let c = if *err { egui::Color32::from_rgb(0xC0, 0x30, 0x30) } else { ui.visuals().text_color() };
-        ui.label(egui::RichText::new(line.chars().take(400).collect::<String>()).monospace().small().color(c));
-    }
+    // In a scroll of their own, so a long error (it wraps) can't push them out of the pane.
+    egui::ScrollArea::vertical().id_salt("script_out").max_height(out_h).auto_shrink([false, true]).show(ui, |ui| {
+        for (line, err) in &app.workflow.script_out {
+            let c = if *err { egui::Color32::from_rgb(0xC0, 0x30, 0x30) } else { ui.visuals().text_color() };
+            ui.label(egui::RichText::new(line.chars().take(400).collect::<String>()).monospace().small().color(c));
+        }
+    });
 }
