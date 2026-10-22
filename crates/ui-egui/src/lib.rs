@@ -760,8 +760,8 @@ impl RustGisApp {
         let mut keys: Vec<(bool, bool, egui::Key)> = self
             .ui
             .keymap
-            .match_order()
-            .into_iter()
+            .bindings
+            .iter()
             .map(|b| b.chord)
             .filter(|c| c.command && !keymap::is_clipboard(*c))
             .map(|c| (c.alt, c.shift, c.key))
@@ -769,6 +769,19 @@ impl RustGisApp {
         keys.sort_by_key(|k| (k.0, k.1, k.2 as u32));
         keys.dedup();
         keys
+    }
+
+    /// A fingerprint of the keymap's key combinations: cheap to take every frame (no
+    /// allocation), it changes when a shortcut is added, removed or rebound, so a caller can
+    /// rebuild [`RustGisApp::command_keys`] only then.
+    pub fn shortcuts_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for b in &self.ui.keymap.bindings {
+            b.chord.hash(&mut h);
+        }
+        self.ui.keymap.bindings.len().hash(&mut h);
+        h.finish()
     }
 
     /// Whether a browser key press (its `key` and `code`, Ctrl or ⌘ held, Alt, Shift) is one of

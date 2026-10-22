@@ -338,6 +338,22 @@ mod tests {
         }
     }
 
+    /// The web app rebuilds its list of taken keys only when the fingerprint moves: it must move
+    /// when a shortcut is rebound.
+    #[test]
+    fn the_shortcuts_fingerprint_follows_the_keymap() {
+        let mut app = crate::RustGisApp::with_sample();
+        let before = app.shortcuts_fingerprint();
+        assert_eq!(before, app.shortcuts_fingerprint(), "stable while nothing changes");
+        let mod_d = Chord::parse("Mod+D");
+        let Some(b) = app.ui.keymap.bindings.iter_mut().find(|b| Some(b.chord) == mod_d) else {
+            panic!("Mod+D is bound");
+        };
+        b.chord = Chord { command: true, alt: false, shift: false, key: Key::J };
+        assert_ne!(before, app.shortcuts_fingerprint());
+        assert!(crate::RustGisApp::takes_browser_key(&app.command_keys(), "j", "KeyJ", true, false, false));
+    }
+
     #[test]
     fn chords_read_and_write() {
         let c = Chord::parse("Mod+Shift+Z");

@@ -250,7 +250,7 @@ pub fn start() {
                     } else {
                         None
                     };
-                    Ok(Box::new(WebShell { app, inbox, notes, dirty, embed, taken }))
+                    Ok(Box::new(WebShell { app, inbox, notes, dirty, embed, taken, taken_print: None }))
                 }),
             )
             .await;
@@ -310,6 +310,8 @@ struct WebShell {
     embed: Option<Embed>,
     /// The app's Ctrl (⌘) shortcuts, kept current for [`keep_app_shortcuts`].
     taken: TakenKeys,
+    /// [`RustGisApp::shortcuts_fingerprint`] when `taken` was last filled.
+    taken_print: Option<u64>,
 }
 
 /// The app's Ctrl (⌘) shortcuts as (Alt, Shift, key): [`RustGisApp::command_keys`], shared with
@@ -443,10 +445,12 @@ impl eframe::App for WebShell {
         }
         self.app.logic(ctx);
         self.dirty.set(self.app.session.dirty);
-        // The shortcuts can be changed in the app: the key listener follows.
-        let keys = self.app.command_keys();
-        if *self.taken.borrow() != keys {
-            *self.taken.borrow_mut() = keys;
+        // The shortcuts can be changed in the app: the key listener follows, rebuilt only when
+        // the keymap changed.
+        let print = self.app.shortcuts_fingerprint();
+        if self.taken_print != Some(print) {
+            self.taken_print = Some(print);
+            *self.taken.borrow_mut() = self.app.command_keys();
         }
     }
 
@@ -948,6 +952,12 @@ fn download(name: &str, bytes: &[u8]) -> Result<(), String> {
 fn keep_app_shortcuts(taken: TakenKeys) -> Result<(), String> {
     let window = web_sys::window().ok_or("no window")?;
     let on_key = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+        // AltGr reports as Ctrl+Alt on Windows: it types a character, it isn't a shortcut.
+        if e.get_modifier_state("AltGraph") {
+            return;
+        }
+        // As eframe reads it, Ctrl or ⌘ is egui's command on every platform, so the app's
+        // shortcut runs on either and the browser's is kept from both.
         let command = e.ctrl_key() || e.meta_key();
         if RustGisApp::takes_browser_key(&taken.borrow(), &e.key(), &e.code(), command, e.alt_key(), e.shift_key()) {
             e.prevent_default();
