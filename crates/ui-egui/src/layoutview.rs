@@ -139,19 +139,30 @@ pub(crate) fn follow_project(app: &mut RustGisApp) {
 const PAN_OVERSCAN: f64 = 1.0;
 /// Most pixels a pan's preview is drawn with: it's drawn on the spot as the pan starts.
 const PAN_PREVIEW_PIXELS: f64 = 6_000_000.0;
+/// Longest side, in pixels, a pan's preview is drawn with, within what the GPU takes.
+const PAN_PREVIEW_SIDE: f64 = 8192.0;
 
 /// A map frame's map with [`PAN_OVERSCAN`] past each side, at the screen's resolution (or less,
-/// within [`PAN_PREVIEW_PIXELS`]), for a pan's preview.
+/// within [`PAN_PREVIEW_PIXELS`] and [`PAN_PREVIEW_SIDE`]), for a pan's preview. It doesn't wait
+/// for tiles still on their way, as it's drawn while the pointer moves.
 fn pan_preview(app: &mut RustGisApp, ctx: &egui::Context, layout: &Layout, id: u32, s: f32) -> Option<egui::TextureHandle> {
     let e = layout.element(id)?;
     let ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } = &e.kind else { return None };
+    // A tilted view's perspective follows the drawing's height, so a taller drawing wouldn't match
+    // the frame: a pitched frame slides the page as before.
+    if *pitch != 0.0 {
+        return None;
+    }
     let m = app.session.project.maps.iter_mut().find(|m| m.name.eq_ignore_ascii_case(map))?;
     let cam = frame_camera(m, *center, *scale, *bearing, *pitch);
     let k = 1.0 + 2.0 * PAN_OVERSCAN;
     let (w, h) = (e.w * PT_PER_MM * k, e.h * PT_PER_MM * k);
     let screen = f64::from(s) / PT_PER_MM * f64::from(ctx.pixels_per_point());
-    let ppp = screen.min((PAN_PREVIEW_PIXELS / (w * h).max(1.0)).sqrt()).max(0.01);
-    let pm = rustgis_engine::render::layout::frame_map(m, cam, w, h, ppp)?;
+    // Within the pixel budget, and within the longest side the GPU takes for a texture (a long,
+    // thin frame could pass the first and not the second).
+    let side = (ctx.input(|i| i.max_texture_side) as f64).min(PAN_PREVIEW_SIDE);
+    let ppp = screen.min((PAN_PREVIEW_PIXELS / (w * h).max(1.0)).sqrt()).min(side / w.max(h).max(1.0)).max(0.01);
+    let pm = rustgis_engine::render::layout::frame_map_preview(m, cam, w, h, ppp)?;
     let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
     Some(ctx.load_texture("layout_pan_preview", img, egui::TextureOptions::LINEAR))
 }
