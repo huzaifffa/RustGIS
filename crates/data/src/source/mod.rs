@@ -22,6 +22,7 @@ pub mod gpkg;
 mod gpkg_blob;
 pub mod gpkg_mem;
 pub mod lidar;
+pub mod memory;
 pub mod msconn;
 pub mod myconn;
 #[cfg(not(target_arch = "wasm32"))]
@@ -60,12 +61,42 @@ impl Family {
         }
     }
 
-    /// An OGR SQL filter on the geometry type.
+    /// An OGR SQL filter on the geometry type. Curves and surfaces count as lines and polygons:
+    /// an Esri multipatch, read as a TIN, a polyhedral surface or (from a Shapefile) a geometry
+    /// collection of them, is polygons. A collection of anything else fails the conversion to
+    /// polygons and is left out, as before.
     pub fn filter(self) -> &'static str {
         match self {
             Family::Points => "OGR_GEOMETRY IN ('POINT', 'MULTIPOINT')",
-            Family::Lines => "OGR_GEOMETRY IN ('LINESTRING', 'MULTILINESTRING')",
-            Family::Polygons => "OGR_GEOMETRY IN ('POLYGON', 'MULTIPOLYGON')",
+            Family::Lines => "OGR_GEOMETRY IN ('LINESTRING', 'MULTILINESTRING', 'CIRCULARSTRING', 'COMPOUNDCURVE', 'MULTICURVE')",
+            Family::Polygons => {
+                "OGR_GEOMETRY IN ('POLYGON', 'MULTIPOLYGON', 'CURVEPOLYGON', 'MULTISURFACE', 'TRIANGLE', 'TIN', 'POLYHEDRALSURFACE', 'GEOMETRYCOLLECTION')"
+            }
+        }
+    }
+
+    /// The OGR geometry type its features are converted to: curves become straight segments, and
+    /// a surface's faces the parts of a multipolygon.
+    pub fn ogr_type(self) -> &'static str {
+        match self {
+            Family::Points => "MULTIPOINT",
+            Family::Lines => "MULTILINESTRING",
+            Family::Polygons => "MULTIPOLYGON",
+        }
+    }
+
+    /// The family of an OGR layer geometry type as `ogrinfo -json` spells it (`MultiPolygonZ`,
+    /// `TIN`, `CompoundCurve`); `None` for one that mixes them (`GeometryZ`).
+    pub fn of_ogr_type(ty: &str) -> Option<Family> {
+        let ty = ty.to_ascii_lowercase();
+        if ty.contains("point") {
+            Some(Family::Points)
+        } else if ["polygon", "surface", "tin", "triangle"].iter().any(|k| ty.contains(k)) {
+            Some(Family::Polygons)
+        } else if ["linestring", "circularstring", "curve"].iter().any(|k| ty.contains(k)) {
+            Some(Family::Lines)
+        } else {
+            None
         }
     }
 }
@@ -170,11 +201,60 @@ pub struct Batch {
 
 /// A vector data source read in place.
 pub trait FeatureSource: Send + Sync {
+    /// Whether complete, ordered traversal is available without an interaction row limit.
+    fn streams_chunks(&self) -> bool {
+        false
+    }
+    /// Visits every matching feature in source painter order. Release each chunk before the
+    /// next callback. `bytes` targets owned feature storage; an indivisible larger row is emitted alone.
+    /// Callback errors stop traversal. Success returns an empty, complete summary batch.
+    fn visit_chunks(&self, _extent: Option<Extent>, _bytes: usize, _visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
+        Err(DataError::Format("this provider does not support chunk traversal".into()))
+    }
     fn info(&self) -> &SourceInfo;
     /// Reads the features a request asks for. A source read by its web address fails with
     /// [`remote::NEED`] until the bytes the read needs are fetched: run it with
     /// [`remote::drive`] (see [`FeatureSource::remote`]).
     fn read(&self, req: &Request) -> Result<Batch>;
+    /// A disposable view window bounded by allocated row/geometry/attribute bytes. Providers
+    /// can enforce this during decoding; the fallback probes a small uniform sample before
+    /// sizing the actual read. Full materialization deliberately continues to use `read`.
+    fn read_budgeted(&self, req: &Request, bytes: usize) -> Result<Batch> {
+        let mut request = *req;
+        request.limit = clamp_limit(req.limit).min(128);
+        let mut batch = self.read(&request)?;
+        if req.limit == 0 {
+            batch.features.clear();
+            batch.features.shrink_to_fit();
+            batch.complete = batch.matched == 0;
+            return Ok(batch);
+        }
+        let used = memory::features_bytes(&batch.features);
+        if !batch.complete && used < bytes {
+            // A small probe can hit only unreadable/deleted candidates. An incomplete
+            // empty answer is not proof that the requested extent contains no features.
+            let count = if batch.features.is_empty() {
+                bytes / (std::mem::size_of::<Feature>() * 4)
+            } else {
+                batch.features.len().saturating_mul(bytes / 2) / used.max(1)
+            };
+            let next = clamp_limit(req.limit).min(count).max(1);
+            if next > request.limit {
+                request.limit = next;
+                drop(batch);
+                batch = self.read(&request)?;
+            }
+        }
+        batch.features.shrink_to_fit();
+        while memory::features_bytes(&batch.features) > bytes {
+            if batch.features.len() <= 1 {
+                return Err(DataError::Format("one feature exceeds the view memory budget; load it explicitly for full processing".into()));
+            }
+            memory::halve(&mut batch.features);
+            batch.complete = false;
+        }
+        Ok(batch)
+    }
     /// The file a source reads by its web address, a range at a time.
     fn remote(&self) -> Option<std::sync::Arc<remote::Remote>> {
         None
@@ -599,3 +679,7 @@ pub(crate) fn tls_provider() {
 
 #[cfg(test)]
 mod tests;
+
+pub mod chunk_memory;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod spill;

@@ -37,7 +37,7 @@ projects.
 ### Edit a class
 
 With Unique Values or Graduated Colors, each class in the Symbology pane's list has a colour button
-and a legend label. Pick a colour to give that class its own. Type a label to show in the Layers
+and a legend label. Pick a colour and opacity to give that class its own. Type a label to show in the Layers
 pane and in layout legends instead of the value or range (for example `High income` for
 `1. High income: OECD`); clear it to show the value again. `<all other values>` can be edited the
 same way. Applying the symbology again on the same field keeps the colours, outlines and labels
@@ -48,13 +48,26 @@ class keeps its colour and label while its range stays the same. By command:
 ```text
 layer.classStyle={"layer":"Countries","value":"1. High income: OECD","color":"#2E6B4F","label":"High income"}
 layer.classStyle={"layer":"Countries","index":0,"label":"Under 1 million"}
+layer.classStyle={"layer":"Countries","index":0,"color":"#2E6B4FFF"}
 layer.classStyle={"layer":"Countries","other":true,"label":"No data"}
 ```
 
 `value` names a Unique Values class, `index` a Graduated Colors class (0 is the lowest) and
-`other` the `<all other values>` class; `outline` sets a class's outline colour. A polygon class
-keeps its own transparency (the layer's, as a colour scheme leaves it), so the `AA` of a
-`#RRGGBBAA` colour applies to points and lines only.
+`other` the `<all other values>` class; `outline` sets a class's outline colour.
+`#RRGGBBAA` sets the fill opacity exactly for every geometry type: `FF` is fully opaque for
+print choropleths, `00` fully transparent, and intermediate values partly transparent. The class
+colour picker includes opacity and sends all eight digits, including `FF`. Changing opacity
+keeps the class's RGB colour, even when making a fully transparent class visible again.
+For fully transparent fills, the numeric controls temporarily use linear 0–1 values so you can
+edit the hidden RGB colour without losing it. Other colour pickers keep their numeric settings.
+
+For polygons, six-digit `#RRGGBB` retains the existing translucency, with the legacy minimum
+alpha of 150; new polygon layers still default to 170. Colour schemes preserve a polygon's
+fill opacity when classes are first created or recoloured with `layer.ramp`. Reapplying the
+same field, ranges and scheme also preserves opacity, including edits that change only alpha.
+As with other class colour edits, changing the field or graduated ranges starts fresh; choosing
+a different scheme through `layer.symbology` resets polygon opacity to its default.
+Layer/group transparency still applies on top of the symbol's opacity in maps and exports.
 
 ### Line strokes
 
@@ -147,6 +160,13 @@ Turn labels on per layer (View › Labeling › Label, or the Style tab), then:
 - **Label field and text**: the field the labels show
   (`labels.field={"layer": "Cities", "field": "name"}`), and the text symbol's size, colour, halo
   and bold (`labels.style={"layer": "Cities", "size": 12, "color": "#5A1E0A", "halo": true}`).
+- **SQL**: label only the features that match a SQL clause (the language of definition
+  queries), such as `pop_max > 5000000`. In the Labeling pane, Class › **SQL** › **New
+  expression**: write the clause (the field and operator buttons add to it), **Check** says
+  whether it reads and how many of the features the layer draws at the map's scale match
+  (after its definition query, display filters and time window), and **Apply** sets it in one
+  undo step; **Clear** labels every remaining feature again
+  (`labels.class.update={"layer": "Cities", "where": "pop_max > 5000000"}`).
 - **Visibility Range**: draw labels only between two scales (Out Beyond / In Beyond), or between
   two viewing distances (Closest / Farthest). Clear Limits removes all four.
 - **Placement**: automatic (above points, centred on lines and polygons), centred, or one of

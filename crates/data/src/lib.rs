@@ -46,6 +46,10 @@ pub enum DataError {
     Format(String),
     #[error("unsupported file type: {0}")]
     Unsupported(String),
+    /// A Zarr slice none of whose chunks is there (the array named): a step never written,
+    /// which Zarr reads as its fill value, told apart from a slice that can't be read.
+    #[error("{0}: none of the slice's chunks could be read")]
+    NoChunks(String),
 }
 
 pub type Result<T> = std::result::Result<T, DataError>;
@@ -68,6 +72,13 @@ impl Features {
     /// Whether two are the same rows in memory (one cloned from the other, neither changed since).
     pub fn shares(&self, other: &Features) -> bool {
         std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// A non-owning allocation identity for derived caches. Mutable access dissociates weak
+    /// references through `Arc::make_mut`, even without another strong owner, so an identity
+    /// stops matching after any row, geometry or attribute edit. It does not retain the rows.
+    pub fn allocation_key(&self) -> std::sync::Weak<Vec<Feature>> {
+        std::sync::Arc::downgrade(&self.0)
     }
 
     /// The rows, taking them out of the share (copying them only when another copy holds them).

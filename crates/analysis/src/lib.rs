@@ -14,12 +14,15 @@ pub mod convert;
 pub mod dggs;
 pub mod geodesic;
 pub mod georef;
+pub mod kriging;
 pub mod network;
 pub mod neural;
 pub mod rasterops;
 pub mod tissot;
 mod tools;
 pub mod topology;
+pub mod trend;
+pub mod warp;
 
 pub use tools::{TOOLS, holds_coordinates, simplify_geometry};
 

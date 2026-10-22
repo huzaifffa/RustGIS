@@ -34,7 +34,7 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"database": "as layer.addDatabase", "password"?: string}"#),
         C::new("layer.loadAll", "Load All Features", "Layers", load_all).when(need_streamed).params(r#"{"layer"?: name|id}"#),
         C::new("layer.addUrl", "Add Data From URL", "Home › Add", add_url).params(
-            r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.kml|.kmz|.gpx|.tif (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true zooms to what was added; false keeps the view of a GeoParquet or FlatGeobuf read in place (zoomed to only when the map was empty)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on"}"#,
+            r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true zooms to what was added; false keeps the view of a GeoParquet or FlatGeobuf read in place (zoomed to only when the map was empty)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on"}"#,
         ),
         C::new("layer.addDownload", "Add Downloaded Data", "Home › Add", add_download)
             .params(r#"{"id": a download the app finished (Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes and paging are checked), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error)}"#),
@@ -106,7 +106,7 @@ pub fn commands() -> Vec<C> {
         C::new("layer.classStyle", "Class Style", "Style › Drawing", class_style)
             .when(need_feature_layer)
             .params(
-                r##"{"layer"?, "value"?: text|number (a Unique Values class), "index"?: number (a Graduated Colors class, 0 = the lowest), "other"?: true (Unique Values' <all other values>), "color"?: "#RRGGBB"|"#RRGGBBAA" (a polygon class keeps its own transparency), "outline"?: "#RRGGBB"|"#RRGGBBAA", "label"?: text (the legend label; "" goes back to the value or range)}"##,
+                r##"{"layer"?, "value"?: text|number (a Unique Values class), "index"?: number (a Graduated Colors class, 0 = the lowest), "other"?: true (Unique Values' <all other values>), "color"?: "#RRGGBB" (preserves polygon translucency, minimum alpha 150)|"#RRGGBBAA" (sets alpha exactly), "outline"?: "#RRGGBB"|"#RRGGBBAA", "label"?: text (the legend label; "" goes back to the value or range)}"##,
             ),
         C::new("layer.color", "Symbol Color", "Style › Drawing", |s, p| {
             let hex = s_req(p, "color")?;
@@ -1876,7 +1876,8 @@ fn read_delimited(
 
 /// The file name for data downloaded from `url`: its last path segment when that has an extension
 /// RustGIS reads, else `<segment or "data">.<ext>` with the extension its contents suggest
-/// (an error when they suggest none).
+/// (an error when they suggest none). JPEG 2000 named or recognised by its contents is refused
+/// where GDAL can't run (the browser).
 pub fn url_file_name(url: &str, bytes: &[u8]) -> Result<String, String> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let path = path.split_once("://").map_or(path, |(_, rest)| rest.split_once('/').map_or("", |(_, p)| p));
@@ -1889,13 +1890,23 @@ pub fn url_file_name(url: &str, bytes: &[u8]) -> Result<String, String> {
         .take(120)
         .collect();
     let ext = Path::new(&last).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+    // JPEG 2000 (Sentinel-2's imagery) is read through GDAL, which the browser can't run.
+    let jpeg2000_only_on_desktop = |name: String| {
+        if cfg!(target_arch = "wasm32") { Err(super::raster::JPEG2000_WEB_LIMITATION.to_string()) } else { Ok(name) }
+    };
+    if rustgis_data::raster::is_jpeg2000_name(&last) {
+        return jpeg2000_only_on_desktop(last);
+    }
     let known = rustgis_data::io::READ_EXTENSIONS.contains(&ext.as_str()) || rustgis_data::raster::is_raster_name(&last) || ext == "tsv";
     if known && ext != "json" {
         return Ok(last);
     }
     let stem = Path::new(&last).file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or("data");
     match rustgis_data::io::sniff_extension(bytes) {
-        Some(ext) => Ok(format!("{stem}.{ext}")),
+        Some(ext) => {
+            let name = format!("{stem}.{ext}");
+            if rustgis_data::raster::is_jpeg2000_name(&name) { jpeg2000_only_on_desktop(name) } else { Ok(name) }
+        }
         None => {
             Err("not a data format RustGIS reads (GeoJSON, CSV, GeoParquet, FlatGeobuf, GeoPackage, zipped Shapefiles, KML, GPX, GeoTIFF)"
                 .into())
@@ -1986,7 +1997,7 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
         }
         let bytes = crate::render::rustgis_tiles::cache::download_blocking(url).map_err(named)?;
         let name = url_file_name(url, &bytes).map_err(named)?;
-        super::raster::add_named_bytes(s, p, name, bytes)
+        super::raster::add_named_bytes(s, p, name, bytes).map_err(named)
     }
 }
 
@@ -2369,7 +2380,8 @@ fn class_style(s: &mut Session, p: &Value) -> CmdResult {
             return Err(format!("{k} must be #RRGGBB or #RRGGBBAA"));
         }
     }
-    let style = ClassStyle { color: s.get_color(p, "color")?, outline: s.get_color(p, "outline")?, label };
+    let preserve_fill_alpha = ps(p, "color").is_some_and(|hex| hex.trim().trim_start_matches('#').len() == 6);
+    let style = ClassStyle { color: s.get_color(p, "color")?, outline: s.get_color(p, "outline")?, label, preserve_fill_alpha };
     if style == ClassStyle::default() {
         return Err("nothing to change: give a color, an outline or a label".into());
     }

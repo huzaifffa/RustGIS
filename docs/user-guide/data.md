@@ -66,8 +66,10 @@ FlatGeobuf with a spatial index in WGS 84 (GDAL reprojects it), kept in the cach
 `%LOCALAPPDATA%\RustGIS\cache\gdal` on Windows, or `RUSTGIS_GDAL_CACHE`). Adding the file again
 reuses the conversion until the file changes, and large layers stream like any large FlatGeobuf
 (below). Every layer of the file is added; a layer mixing geometry types is
-added as one layer per type. Projects remember the original file and convert it again if the
-cached copy is gone.
+added as one layer per type. Curves become straight segments, and 3D surfaces (an Esri
+multipatch, such as the buildings of swissBUILDINGS3D, is read as a TIN) become flat
+polygons, one part per face, without their heights. Projects remember the original file and
+convert it again if the cached copy is gone.
 
 ## SQL queries and DuckDB databases
 
@@ -347,13 +349,34 @@ database is kept without its password. The commands `sources.list`, `sources.sav
 ## Large files
 
 GeoPackage, GeoParquet, FlatGeobuf and (on the desktop) Shapefile files with more than 100,000
-features are read in place rather than loaded whole, so files far larger than memory open in a
-moment. The layer reads the features in view, using the file's own spatial index (the GeoPackage
-R-tree, the FlatGeobuf packed R-tree, GeoParquet row-group bounding boxes; for a Shapefile, the
-shapes' bounding boxes, read once when it opens), in the background as the map moves. When a
+features are read in place rather than loaded whole, avoiding an in-memory copy of the entire
+dataset. The layer reads features in view in the background as the map moves, using spatial
+indexes: the GeoPackage R-tree, the FlatGeobuf packed R-tree, GeoParquet row-group bounding
+boxes, or a cached Shapefile R-tree built from the shapes' bounding boxes. When a
 view holds more than 250,000 features (100,000 in the web app), the layer draws an evenly spread
 sample of them and its tooltip in Layers says so: zoom in to see them all. Smaller files load
 whole; `layer.addData` with `"stream": true` or `false` overrides the choice.
+
+On the desktop, opening a large Shapefile for the first time scans its record headers to build
+a disposable SQLite index outside the dataset directory. Reopening an unchanged file reuses
+that index; its canonical path, size and modification time identify the cached generation.
+The record directory and R-tree stay on disk, with an 8 MiB SQLite page-cache target per open
+index and memory mapping disabled. Query results retain file order and the same sampling
+rules. Attributes and the `.prj` are still read from the source files.
+
+Set `RUSTGIS_SHP_CACHE` to choose the cache directory and `RUSTGIS_SHP_CACHE_MIB` to choose
+the retained index budget (2048 MiB by default, clamped to 64–65536 MiB). Idle indexes are
+evicted in least-recently-used order. Open readers and builders hold operating-system leases,
+so another instance cannot evict their indexes; active files can temporarily exceed the
+budget. An index larger than the budget is session-only. Cache checkout and release reclaim
+abandoned builds and temporary indexes. A corrupt cache is rebuilt, and an unavailable cache
+directory falls back to the system temporary directory (a per-user directory on Unix).
+New Unix cache directories are created with mode `0700`. Existing roots must belong to
+the effective user, forbid group/other writes, and have trusted parents; symlink roots
+are rejected. These checks also apply to configured locations. Unsafe locations fall
+back rather than changing their permissions. If neither location works, the
+Shapefile remains readable by scanning record headers without retaining a full in-memory
+index. Deleting idle cache files does not modify the dataset.
 
 On the desktop, a GeoJSON FeatureCollection larger than 32 MB is read the same way, with no size
 limit: opening reads the file once, keeping each feature's place in it and its bounding box (a
@@ -373,6 +396,29 @@ open; a browser upload is kept in the project.
 | FlatGeobuf, the same grid (335 MB) | 1.6 million polygons | 183,000 in 0.11 s |
 | GeoPackage, the same grid (344 MB) | 1.6 million polygons | 183,000 in 0.18 s |
 | GeoParquet, global grid (190 MB) | 6.5 million polygons | a sample of 136,000 in 0.27 s |
+
+### Streamed view memory
+
+Interaction windows share a retained-memory budget across all source layers in a map,
+including hidden layers: 128 MiB on the desktop and 48 MiB in the browser. The budget
+counts allocated row capacity, attribute strings, nested geometry buffers, projected
+geometry, extent arrays and optional display geometry. Complex records can therefore
+reduce the interaction sample even below the existing feature-count limit. Source ids,
+attributes and file order are retained; the sample is marked as incomplete. An individual
+feature that cannot fit produces a layer error instead of silently disappearing.
+
+Projection is prepared with the window on the source worker. Optional thinned geometry
+uses the remaining budget, up to 64 MiB per layer; when it cannot fit, drawing uses the
+original projected geometry. Explicitly loaded layers retain their full source data and
+limit only their optional display caches.
+
+This is a budget for installed interaction caches, not a process-RSS or GPU-memory cap.
+Provider decoding scratch, in-flight reads, shared snapshots and explicit full reads are
+outside it. The generic provider adapter probes a small sample and trims the returned
+window; it does not bound the provider's transient decoding allocations. Blocking map
+exports retain their original row limits and reread instead of reusing a budget-reduced
+interaction window. Full-source loading, analysis, editing, data exports and project
+serialization continue to use the original source data and existing read limits.
 
 ## Rasters
 
@@ -424,7 +470,7 @@ With a raster layer selected in Layers, the **Style** and **Data** tabs show its
 | Tab › Group | Controls |
 | --- | --- |
 | Style › Visibility Range, Effects | Scale range, transparency |
-| Style › Rendering | **Symbology**: Stretch, RGB, Classify, Unique Values, Colormap, Shaded Relief; **Stretch Type**: None, Minimum Maximum, Custom Min/Max (your own bounds), Percent Clip, Standard Deviation, Histogram Equalize; **DRA** (stretch the pixels in view); **Resampling** (nearest or bilinear); **Band Combination** (natural colour, colour infrared, or any bands) |
+| Style › Rendering | **Symbology**: Stretch, RGB, Classify, Unique Values, Colormap, Shaded Relief; **Stretch Type**: None, Minimum Maximum, Custom Min/Max (your own bounds, one pair per colour channel on an RGB layer), Percent Clip, Standard Deviation, Histogram Equalize; **DRA** (stretch the pixels in view); **Resampling** (nearest or bilinear); **Band Combination** (natural colour, colour infrared, or any bands) |
 | Style › Enhancement | Brightness, contrast, gamma |
 | Data | Raster information (size, bands, statistics, coordinate system) and Export Raster (GeoTIFF) |
 
@@ -483,9 +529,52 @@ Google Cloud's CMIP6 bucket does, ARCO-ERA5's doesn't (the desktop reads both).
 rustgis-cli run --cmd 'layer.addZarr={"url":"https://storage.googleapis.com/gcp-public-data-arco-era5/ar/1959-2022-full_37-1h-0p25deg-chunk-1.zarr-v2","variable":"2m_temperature","index":{"time":539100}}'
 ```
 
-A store in a folder is saved in the project by its folder and slice (`2m_temperature[time=539100]`)
-and read again when the project opens, as Add Data on the folder does (its first variable); a
-store by web address is kept in the project as the slice read. `?zarr=<address>` in a web app link
+**Follow the time slider** (desktop; `layer.addZarr` with `"time": true`) adds the variable as one
+layer whose step is the time slider's. The slider turns on over the variable's dates when it is
+off, and the layer shows the last of its steps in the slider's window, or nothing when none falls
+in it. Moving or playing the slider reads that step's slice (only its chunks), keeping the last
+eight read. A web store's next two steps are read ahead in the background. The stretch is fixed at
+the first slice's range, so a colour means the same value at every step, and **Export** writes an
+animation of it. An axis longer than the slider's 20,000 steps (hourly ERA5) takes a period with `"start"` and
+`"end"`; given neither (as the dialog adds it), the layer takes 20,000 steps from the one picked. The project keeps such a layer by its store (a folder or a web address)
+and selection, not as a slice, and reads the slider's step again when it opens.
+
+```sh
+rustgis-cli run --cmd 'layer.addZarr={"path":"air.zarr","variable":"t","time":true}' --cmd 'time.export={"path":"t.gif"}'
+```
+
+**View › Time Series** (desktop; `zarr.series`) reads a Zarr variable's values through time at a
+point. Pick a Zarr layer, then **Pick a Point** on the map. A layer that follows the time slider
+gives its period, a slice the whole axis, and `"start"`/`"end"` any other. Only the chunks holding
+that point's cell are read. A store chunked one step at a time, such as ARCO-ERA5's map-oriented
+copy, reads a chunk per step: about 4,000 steps at most, so a long axis needs a shorter period.
+The chart draws up to six points as lines and marks the time slider's step, and a click on it
+takes the slider to that date. **Export CSV…** writes the date and value of each point.
+
+```sh
+rustgis-cli run --cmd 'zarr.series={"path":"air.zarr","variable":"t","lon":-55.7,"lat":-12.5}'
+```
+
+**Summarise over time** (in the Time Series pane; `zarr.reduce`) makes a raster of one statistic of
+a Zarr variable's steps: **mean**, **min**, **max**, **sum**, **std** (the population standard
+deviation), **count** of values, or **countAbove** a threshold (days above 30 °C, say). It reads a
+layer's period by default, else the `"start"`/`"end"` given, and `"months"` keeps one season across
+years (`[12, 1, 2]`). Slices are read one at a time and folded into running totals (12 to 20 bytes a
+cell, for grids of up to 32 million cells), so memory depends on the grid, not on the period: at most
+20,000 steps, with progress and **Cancel** in the app. A cell keeps no value when it had fewer values
+than `"minValid"` (a share, 0 by default) of the steps read; with the default, **count** and
+**countAbove** give 0 where a cell never had a value (land in an ocean variable, say), and a
+`"minValid"` above 0 leaves such cells empty. The layer is named after what it holds (`tas mean 1991-01-01–2020-12-31`) and kept in the
+project as a GeoTIFF.
+
+```sh
+rustgis-cli run --cmd 'zarr.reduce={"path":"air.zarr","variable":"t","stat":"mean","months":[12,1,2]}'
+```
+
+A single step (a layer that doesn't follow the slider) from a store in a folder is saved in the
+project by its folder and slice (`2m_temperature[time=539100]`) and read again when the project
+opens, as Add Data on the folder does (its first variable); a single step from a store by web
+address is kept in the project as the slice read. `?zarr=<address>` in a web app link
 opens the dialog on a store.
 
 ## Project items
@@ -512,3 +601,41 @@ map file or project. Data › Layer Templates adds empty layers with ready-made 
 routes, areas, observations…) to draw into. Add Folder connects a folder to the Browser, which
 also lists the project's layouts, styles and tasks. A task's steps each run a command; New Task
 From History turns the geoprocessing history into a task you can replay.
+
+### Complete streamed Shapefile rendering
+
+The CPU renderer traverses a streamed Shapefile in source order instead of painting only
+its interaction sample. Shapes and attributes arrive in chunks targeting 8 MiB of owned
+feature storage; projection and display geometry are temporary copies of one chunk.
+Whole-file imports, loading for editing and other providers retain their existing read APIs.
+An indivisible row exceeding the chunk target is emitted alone, preserving its full geometry.
+A zero budget reports an error.
+
+Styles, definition queries, display filters and label classes use the same painter as an
+in-memory layer. The renderer chooses geometry simplification from statistics over the whole
+layer, accumulates point bins across chunks, applies transparency and blend once per layer,
+and draws selection highlights after the whole layer. Labels share the existing global
+priority, stable tie ordering, collision rules and 20,000-candidate placement limit.
+Screen rendering and PNG/layout exports share this traversal. Live redraws of a streamed
+Shapefile therefore also read the complete source; line/polygon layers currently make an
+additional statistics pass. Interaction windows remain byte-budgeted, but they are not a
+shortcut for this complete painter, so redraws can be I/O intensive on large files.
+
+Native flat extrusions use a private disposable SQLite ordering workspace (2 MiB page-cache
+target, memory mapping disabled, 4 GiB database ceiling), with a global shadow pass followed
+by globally sorted solids. It is removed when rendering finishes. Failure or incomplete
+traversal does not publish a partial successful frame. This workspace is not a reusable index.
+
+This is not a fixed bound on total renderer memory: raster targets, label candidates and the
+existing combined polygon-mask path have separate costs. Upright perspective point markers
+and polygon extrusions retain the complete upstream depth renderer through an isolated
+full-source snapshot. Upright points require a known source total of at most 50,000 rows;
+larger or unknown totals use complete ground-marker traversal, independent of the current
+interaction-window size. Plain fills, lines and mask sources continue complete chunk traversal
+per band, including terrain bands; they do not consume that snapshot's feature budget.
+Retained complete-source feature storage across the snapshot has a separate budget (512 MiB natively, 192 MiB in the browser).
+Exceeding it fails the whole frame with a source diagnostic, without sampling or truncating
+features; raster targets, derived geometry caches and decoding scratch are outside that budget. Flat line/polygon rendering
+makes a statistics pass before painting and currently reads the entire source, so it trades
+additional I/O for complete rendering and predictable chunk storage. Geometry preprocessing
+and GPU preparation are separate optimizations.

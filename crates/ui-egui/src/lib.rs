@@ -51,10 +51,13 @@ mod relayshot;
 mod reportpane;
 mod ribbon;
 mod s3ui;
+mod scriptcolor;
+mod scriptcomplete;
 mod searchbox;
 mod serviceui;
 mod showme;
 mod sourcespane;
+mod sqlbox;
 mod sqlpane;
 mod stacui;
 mod table;
@@ -394,6 +397,8 @@ pub enum RightPane {
     Tasks,
     Jobs,
     Profile,
+    /// A Zarr variable's time series at points clicked on the map (#555).
+    TimeSeries,
     Diagnostics,
     Infographics,
     Report,
@@ -1454,7 +1459,9 @@ impl RustGisApp {
         let Some(spec) = self.session.registry.get(id).filter(|c| c.mutates).copied() else { return };
         // Downloaded data is kept for this session only, and adding it uses it up: a task
         // couldn't add it again.
-        if id == "layer.addDownload" {
+        // A result handed over by the app (`ran`: a summary worked out on a thread) is used up
+        // the same way.
+        if id == "layer.addDownload" || (matches!(id, "layer.addZarr" | "cube.trend") && params.get("ran").is_some_and(|r| !r.is_null())) {
             let text = crate::i18n::fmt(
                 "{command} isn't recorded: the downloaded data is kept for this session only, so a task couldn't add it again.",
                 &[("command", tl_raw!(spec.label))],
@@ -2381,6 +2388,7 @@ impl RustGisApp {
             },
             "ui.pane.jobs" => toggle_right(&mut self.ui, RightPane::Jobs),
             "ui.pane.profile" => toggle_right(&mut self.ui, RightPane::Profile),
+            "ui.pane.timeSeries" => toggle_right(&mut self.ui, RightPane::TimeSeries),
             "ui.pane.diagnostics" => toggle_right(&mut self.ui, RightPane::Diagnostics),
             "ui.pane.infographics" => toggle_right(&mut self.ui, RightPane::Infographics),
             "ui.pane.report" => toggle_right(&mut self.ui, RightPane::Report),
@@ -2473,6 +2481,7 @@ impl RustGisApp {
                 }
             }
             "ui.modelBuilder" => modelbuilder::command(self, p)?,
+            "ui.importModel" => modelbuilder::import(self),
             "ui.catalogView" => self.ws.catalog_view = p.get("on").and_then(Value::as_bool).unwrap_or(!self.ws.catalog_view),
             "ui.itemPopups" => self.ws.item_popups = p.get("on").and_then(Value::as_bool).unwrap_or(!self.ws.item_popups),
             "ui.linkCursors" => self.ws.link_cursors = p.get("on").and_then(Value::as_bool).unwrap_or(!self.ws.link_cursors),
@@ -3361,6 +3370,8 @@ const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
     "share.webLayer",
     "share.webStyle",
     "share.locator",
+    "zarr.reduce",
+    "cube.trend",
 ];
 
 #[cfg(test)]
