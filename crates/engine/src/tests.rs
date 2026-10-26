@@ -13695,6 +13695,12 @@ fn layout_elements_are_brought_to_the_front_and_sent_to_the_back() {
     s.run("edit.undo", &Value::Null).unwrap(); // the lock
     s.run("edit.undo", &Value::Null).unwrap(); // forward
     assert_eq!(order(&s, legend.id).0, 0);
+    // A move that changes nothing (back, for the element already at the bottom) succeeds but is
+    // no step to undo.
+    let depth = s.undo_depth();
+    let r = s.run("layout.arrange", &json!({"element": legend.id, "to": "back"})).unwrap();
+    assert_eq!(r["index"].as_u64(), Some(0));
+    assert_eq!(s.undo_depth(), depth, "no empty undo step");
 }
 
 #[test]

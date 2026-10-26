@@ -200,8 +200,14 @@ fn arrange(s: &mut Session, p: &Value) -> CmdResult {
         return Err(format!("no element {id}"));
     }
     unlocked(l, id)?;
+    let before = l.draw_order(id).map(|(i, _)| i);
     let index = l.arrange(id, to).ok_or_else(|| format!("no element {id}"))?;
-    Ok(json!({"element": id, "index": index, "of": l.elements.len()}))
+    let of = l.elements.len();
+    // A move that changes nothing (front for the element already on top) is no step to undo.
+    if before == Some(index) {
+        s.request_only = true;
+    }
+    Ok(json!({"element": id, "index": index, "of": of}))
 }
 
 /// Refuses to change a locked element (#536).
