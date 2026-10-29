@@ -2,6 +2,7 @@
 //! layer's label visibility range and placement, and its label classes (#618).
 
 use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
+use rustgis_geom::Coord;
 use rustgis_map::symbology::{MAX_LABEL_CLASSES, label_class_name};
 use rustgis_map::{LabelBackground, LabelClass, LabelMatcher, LabelPlacement, Labeling, Renderer, Rgba, Symbol};
 use serde_json::{Value, json};
@@ -206,25 +207,32 @@ pub fn commands() -> Vec<C> {
                     let a = v.as_array().filter(|a| a.len() == 2).ok_or("to is [x, y] (longitude, latitude)")?;
                     let xy = [a.first().and_then(number), a.get(1).and_then(number)];
                     match xy {
-                        [Some(x), Some(y)] if x.is_finite() && y.is_finite() && x.abs() <= 540.0 && y.abs() <= 90.0 => Some([x, y]),
-                        _ => return Err("to is [x, y]: a longitude and a latitude".into()),
+                        [Some(x), Some(y)] if rustgis_map::symbology::is_label_place([x, y]) => Some([x, y]),
+                        _ => return Err("to is [x, y]: a longitude (within ±540) and a latitude (within ±90)".into()),
                     }
                 }
             };
-            with_labels(s, p, |labels| {
+            let r = with_labels(s, p, |labels| {
                 let c = class_in(labels, p)?;
                 if c.move_label(feature, to) {
                     Ok(())
                 } else {
                     Err(format!("a label class keeps at most {} labels moved", rustgis_map::symbology::MAX_MOVED_LABELS))
                 }
-            })
+            })?;
+            // Locked, the labels are locked again where they are placed next: the one moved may
+            // not have been placed when the lock was taken.
+            s.map_mut().label_lock = None;
+            Ok(r)
         })
         .when(need_feature_layer)
         .params(r#"{"layer"?, "class"?: name (none: the Default class), "feature": the feature's id, "to": [x, y] (longitude, latitude: where the label's text is centred) | null (back where its class puts it)}"#),
         C::new("labels.resetMoved", "Reset Moved Labels", "Labeling › Label Placement", |s, p| {
-            let all = b(p, "all").unwrap_or(false);
-            with_labels(s, p, |labels| {
+            let all = match p.get("all") {
+                None | Some(Value::Null) => false,
+                Some(v) => v.as_bool().ok_or("all must be true or false")?,
+            };
+            let r = with_labels(s, p, |labels| {
                 if all {
                     labels.default.moved.clear();
                     labels.classes.iter_mut().for_each(|c| c.moved.clear());
@@ -232,7 +240,10 @@ pub fn commands() -> Vec<C> {
                     class_in(labels, p)?.moved.clear();
                 }
                 Ok(())
-            })
+            })?;
+            // As after a move: those put back are locked again where they are placed next.
+            s.map_mut().label_lock = None;
+            Ok(r)
         })
         .when(need_feature_layer)
         .params(r#"{"layer"?, "class"?: name (none: the Default class), "all"?: bool (every class of the layer)}"#),
@@ -519,6 +530,8 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
             if classes {
                 attrs.push(Attr::Text(class.name.clone()));
             }
+            // A label moved by hand becomes an annotation where it was put.
+            let at = class.moved_to(ft.id).map_or(at, |[x, y]| Coord::new(x, y));
             ds.push(Some(Geometry::Point(at)), attrs);
         }
     }
@@ -535,6 +548,8 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         // On its point, never round it: an annotation stays where it is (#1011).
         c.placement = LabelPlacement::Center;
         c.other_positions = false;
+        // The annotations' ids aren't the features': each moved label is already at its place.
+        c.moved.clear();
         // Each class picks the points it labelled, Default too once there are others (#732):
         // with no clause it would label theirs as well.
         c.where_ = classes.then(|| format!("\"CLASS\" = '{}'", c.name.replace('\'', "''")));

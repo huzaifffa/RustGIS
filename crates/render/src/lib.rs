@@ -2085,15 +2085,22 @@ fn affine(src: [(f64, f64); 3], dst: [(f64, f64); 3]) -> Option<Transform> {
 fn lift_labels(view: &View, ground: &terrain::Ground, candidates: &mut [Candidate]) {
     let cam = view.camera;
     let (w, h) = (view.width, view.height);
-    for Candidate { label: l, alternatives, .. } in candidates.iter_mut() {
-        let Some(m) = cam.try_to_map(f64::from(l.x), f64::from(l.y), w, h) else { continue };
+    let lift = |x: f32, y: f32| {
+        let m = cam.try_to_map(f64::from(x), f64::from(y), w, h)?;
         let (u, v) = cam.ground_px(m);
-        let Some((sx, sy)) = cam.project_raised(u, v, ground.up_px(m, &cam), w, h) else { continue };
-        let (dx, dy) = (sx as f32 - l.x, sy as f32 - l.y);
-        if !(dx.is_finite() && dy.is_finite()) {
-            continue;
+        let (sx, sy) = cam.project_raised(u, v, ground.up_px(m, &cam), w, h)?;
+        let (sx, sy) = (sx as f32, sy as f32);
+        (sx.is_finite() && sy.is_finite()).then_some((sx, sy))
+    };
+    for Candidate { label: l, alternatives, .. } in candidates.iter_mut() {
+        let Some((sx, sy)) = lift(l.x, l.y) else { continue };
+        let (dx, dy) = (sx - l.x, sy - l.y);
+        // A callout's feature onto the ground under it, not under the label.
+        if let Some([ax, ay]) = l.collide.callout_anchor {
+            let (fx, fy) = lift(l.x + ax, l.y + ay).unwrap_or((l.x + ax + dx, l.y + ay + dy));
+            l.collide.callout_anchor = Some([fx - sx, fy - sy]);
         }
-        (l.x, l.y) = (sx as f32, sy as f32);
+        (l.x, l.y) = (sx, sy);
         if let Some(i) = &mut l.icon {
             (i.x, i.y) = (i.x + dx, i.y + dy);
         }
@@ -2300,6 +2307,18 @@ fn raise_labels(map: &Map, view: &View, candidates: &mut [Candidate]) {
         let (u, v) = cam.ground_px(m);
         let Some((sx, sy)) = cam.project_raised(u, v, up, w, h) else { continue };
         let (dx, dy) = (sx as f32 - l.x, sy as f32 - l.y);
+        // A callout's feature onto its roof where it is, not where the label is.
+        if let Some([ax, ay]) = l.collide.callout_anchor {
+            let (fx, fy) = (l.x + ax, l.y + ay);
+            let roof = cam
+                .try_to_map(f64::from(fx), f64::from(fy), w, h)
+                .map(|m| cam.ground_px(m))
+                .and_then(|(u, v)| cam.project_raised(u, v, up, w, h))
+                .map(|(x, y)| (x as f32, y as f32))
+                .filter(|(x, y)| x.is_finite() && y.is_finite());
+            let (fx, fy) = roof.unwrap_or((fx + dx, fy + dy));
+            l.collide.callout_anchor = Some([fx - sx as f32, fy - sy as f32]);
+        }
         (l.x, l.y) = (sx as f32, sy as f32);
         if let Some(i) = &mut l.icon {
             (i.x, i.y) = (i.x + dx, i.y + dy);
@@ -3536,6 +3555,17 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                     .fold(0.0, f32::max);
                 let offset_reach = f64::from(offset_reach);
                 let (vw, vh) = (ctx.view.width, ctx.view.height);
+                // Labels moved by hand (the Move Label tool): any class's, its feature known by
+                // its id. Where one was put is in view or not whatever its feature's place.
+                let any_moved = labels.in_order().zip(&label_fields).any(|(c, f)| f.is_some() && !c.moved.is_empty());
+                // (Kept as longitude and latitude: the flat map draws its projection's coordinates,
+                // as its features' `geoms` are; the globe draws longitude and latitude.)
+                let moved_to = |class: &rustgis_map::LabelClass, fid: Option<u64>| {
+                    fid.and_then(|id| class.moved_to(id))
+                        .map(|[x, y]| Coord::new(x, y))
+                        .and_then(|c| if globe.is_some() { Some(c) } else { flat.forward_checked(c) })
+                        .and_then(|c| ctx.screen(c))
+                };
                 for (row, g) in geoms.iter().enumerate() {
                     let Some(g) = g else { continue };
                     if rows.get(row) != Some(&true) {
@@ -3554,7 +3584,9 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                         None
                     };
                     let line_in_view = || globe.is_some() || ctx.cull.intersects(&extents.get(row).copied().unwrap_or_else(|| g.extent()));
-                    if point.is_none() && !(any_along && matches!(g, Geometry::Line(_)) && line_in_view()) {
+                    let fid = layer.dataset.features.get(row).map(|f| f.id);
+                    let moved_here = || any_moved && classes.classes_of(ds_ptr, row).any(|(_, c)| moved_to(c, fid).is_some());
+                    if point.is_none() && !(any_along && matches!(g, Geometry::Line(_)) && line_in_view()) && !moved_here() {
                         continue;
                     }
                     let is_point = g.kind() == GeometryType::Point;
@@ -3579,9 +3611,14 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                         if locked_classes.as_ref().is_some_and(|k| !k.contains(&(lid, label_row(row), ci))) {
                             continue;
                         }
-                        if point.is_none() && !along_line(class.placement, g) {
+                        // Moved by hand: one label, upright, where it was put.
+                        let moved = if any_moved { moved_to(class, fid) } else { None };
+                        if point.is_none() && moved.is_none() && !along_line(class.placement, g) {
                             continue;
                         }
+                        // Its feature's place, for a callout's line back to it: off the screen too
+                        // when the label was moved into view.
+                        let anchor = point.or_else(|| moved.and_then(|_| ctx.screen(c)));
                         // (Along a line, the label is put on its stretch in view below.)
                         let (x, y) = point.unwrap_or_default();
                         let Some(fi) = label_fields.get(ci).copied().flatten() else { continue };
@@ -3616,7 +3653,9 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                         // Where it goes, each with its repeat's index: by its feature (0), or along
                         // a line at its middle and, repeated, every so far either side.
                         let mut places: Vec<(usize, f32, f32, Option<f32>, Vec<LabelGlyph>)> = Vec::new();
-                        if let (LabelPlacement::Parallel | LabelPlacement::Curved, Geometry::Line(parts)) = (class.placement, g) {
+                        if let Some((mx, my)) = moved {
+                            places.push((0, mx as f32, my as f32, None, Vec::new()));
+                        } else if let (LabelPlacement::Parallel | LabelPlacement::Curved, Geometry::Line(parts)) = (class.placement, g) {
                             let line =
                                 screen_line.get_or_insert_with(|| longest_on_screen(ctx, parts).and_then(|l| line_labels::Line::new(&l)));
                             let Some(line) = line.as_ref() else { continue };
@@ -3651,20 +3690,6 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                         } else {
                             let (lx, ly) = place(class.placement);
                             places.push((0, lx, ly, None, Vec::new()));
-                        }
-                        // Moved by hand (the Move Label tool): one label, upright, where it was
-                        // put, its feature known by its id.
-                        let fid = layer.dataset.features.get(row).map(|f| f.id);
-                        // (Kept as longitude and latitude: the flat map draws its projection's
-                        // coordinates, as its features' `geoms` are; the globe draws longitude and
-                        // latitude.)
-                        let moved = fid
-                            .and_then(|id| class.moved_to(id))
-                            .map(|at| Coord::new(at[0], at[1]))
-                            .and_then(|c| if globe.is_some() { Some(c) } else { flat.forward_checked(c) })
-                            .and_then(|c| ctx.screen(c));
-                        if let Some((mx, my)) = moved {
-                            places = vec![(0, mx as f32, my as f32, None, Vec::new())];
                         }
                         // Layers above first, then the classes listed first (#732), then bigger
                         // polygons: a class (ci ≤ MAX_LABEL_CLASSES, 1e9 each) never outweighs a
@@ -3724,7 +3749,7 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                                         } else {
                                             0.0
                                         },
-                                        callout_anchor: point.is_some().then_some([x as f32 - lx, y as f32 - ly]),
+                                        callout_anchor: anchor.map(|(ax, ay)| [ax as f32 - lx, ay as f32 - ly]),
                                         pinned: moved.is_some(),
                                         source: fid.map(|id| (lid, id, ci as u32)),
                                         ..Default::default()
@@ -4497,9 +4522,14 @@ const MAX_CALLOUT_SEARCHES: usize = 500;
 /// A label's text's extent (points, `[x0, y0, x1, y1]`), as placement keeps it clear of the
 /// others: what the Move Label tool picks it by.
 pub fn label_extent(l: &PlacedLabel) -> Option<[f32; 4]> {
-    let (text, _) = label_boxes(l);
-    let e =
-        text.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |e, b| [e[0].min(b[0]), e[1].min(b[1]), e[2].max(b[2]), e[3].max(b[3])]);
+    boxes_extent(&label_boxes(l).0)
+}
+
+/// The extent of boxes (`[x0, y0, x1, y1]` each); none for none.
+fn boxes_extent(boxes: &[[f32; 4]]) -> Option<[f32; 4]> {
+    let e = boxes
+        .iter()
+        .fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |e, b| [e[0].min(b[0]), e[1].min(b[1]), e[2].max(b[2]), e[3].max(b[3])]);
     (e[0] <= e[2] && e[1] <= e[3]).then_some(e)
 }
 
@@ -4515,9 +4545,8 @@ pub fn callout_to(l: &PlacedLabel) -> Option<[f32; 4]> {
 /// A callout's line, from its feature at `anchor` to the nearest edge of the text's boxes; none
 /// when the text covers the feature.
 fn callout_line(text: &[[f32; 4]], anchor: [f32; 2]) -> Option<[f32; 4]> {
-    let e =
-        text.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |e, b| [e[0].min(b[0]), e[1].min(b[1]), e[2].max(b[2]), e[3].max(b[3])]);
-    if e[0] > e[2] || !anchor.iter().all(|v| v.is_finite()) {
+    let e = boxes_extent(text)?;
+    if !anchor.iter().all(|v| v.is_finite()) {
         return None;
     }
     let to = [anchor[0].clamp(e[0], e[2]), anchor[1].clamp(e[1], e[3])];
@@ -4536,14 +4565,14 @@ fn callout_spot(
     w: f32,
     h: f32,
 ) -> Option<(f32, f32, [f32; 4])> {
-    let ext =
-        text.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |e, b| [e[0].min(b[0]), e[1].min(b[1]), e[2].max(b[2]), e[3].max(b[3])]);
-    if !(anchor[0].is_finite() && anchor[1].is_finite() && reach.is_finite()) || ext[0] > ext[2] {
+    let ext = boxes_extent(text)?;
+    if !(anchor[0].is_finite() && anchor[1].is_finite() && reach.is_finite()) {
         return None;
     }
-    // Out in rings half the text's height apart, as far as its line may reach past its size.
-    let step = ((ext[3] - ext[1]) * 0.5).clamp(2.0, 20.0);
+    // Out in rings half the text's height apart, as far as its line may reach past its size: at
+    // most 60 of them, farther apart for a long reach, so the last still gets that far.
     let far = reach + (ext[2] - ext[0]).max(ext[3] - ext[1]);
+    let step = ((ext[3] - ext[1]) * 0.5).clamp(2.0, 20.0).max(far / 60.0);
     let rings = ((far / step).ceil() as usize).clamp(1, 60);
     for ring in 1..=rings {
         let d = ring as f32 * step;
@@ -5510,9 +5539,6 @@ mod tests {
         assert!(starfield(1e9).is_some_and(|t| t.width() == 2048));
     }
 
-    /// Each label class labels every feature its clause takes, as in ArcGIS Pro (#732): a feature
-    /// two classes take gets a label from each, the class listed first placed first. A hidden
-    /// class labels none, and a clause that no longer reads takes none (#618).
     /// A label moved by hand is drawn where it was put, on the flat map: its place is kept as
     /// longitude and latitude, and drawn through the map's projection as its feature is.
     /// (Taken for the projection's own coordinates, it was drawn off by Null Island instead.)
@@ -5547,6 +5573,61 @@ mod tests {
         assert!(!lyon.collide.pinned && lyon.collide.callout.is_none());
     }
 
+    /// A label moved by hand into view is drawn whatever its feature's place: a point's, or a
+    /// line's labelled along it, out of view, its callout's line reaching back off the screen.
+    #[test]
+    fn a_label_moved_into_view_is_drawn_with_its_feature_out_of_it() {
+        let mut m = Map::new("Map");
+        let mut d = Dataset::new("pts", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        d.push(Some(Geometry::Point(Coord::new(2.35, 48.85))), vec![Value::Text("Paris".into())]);
+        let pts = m.add_dataset(d);
+        let mut d = Dataset::new("lines", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        d.push(Some(Geometry::Line(vec![vec![Coord::new(1.0, 44.0), Coord::new(3.0, 44.0)]])), vec![Value::Text("Garonne".into())]);
+        let lines = m.add_dataset(d);
+        for (id, to) in [(pts, [20.0, 50.0]), (lines, [20.0, 47.0])] {
+            let fid = m.layer(id).unwrap().dataset.features.first().unwrap().id;
+            let l = m.layer_mut(id).unwrap();
+            l.labels.enabled = true;
+            l.labels.default.callout = Some(40.0);
+            if id == lines {
+                l.labels.default.placement = LabelPlacement::Parallel;
+            }
+            assert!(l.labels.default.move_label(fid, Some(to)));
+        }
+        // Over Central Europe: France is off the left of the view.
+        let camera = Camera { center: lonlat_to_merc(Coord::new(20.0, 48.5)), res: 2000.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+        let on_screen = |m: &Map, lon: f64, lat: f64| view.to_screen(m.to_map(Coord::new(lon, lat)).unwrap());
+        assert!(on_screen(&m, 2.35, 48.85).0 < 0.0 && on_screen(&m, 3.0, 44.0).0 < 0.0, "the features are out of view");
+        let labels = render(&mut m, &view).unwrap().labels;
+        for (text, at) in [("Paris", (20.0, 50.0)), ("Garonne", (20.0, 47.0))] {
+            let l = labels.iter().find(|l| l.text == text).unwrap_or_else(|| panic!("{text}'s label is drawn"));
+            let (ex, ey) = on_screen(&m, at.0, at.1);
+            assert!((f64::from(l.x) - ex).abs() < 0.5 && (f64::from(l.y) - ey).abs() < 0.5, "{text}");
+            assert!(l.collide.pinned && l.angle.is_none() && l.glyphs.is_empty(), "{text}: upright where it was put");
+            let [x0, ..] = l.collide.callout.unwrap_or_else(|| panic!("{text}: a line back to its feature"));
+            assert!(l.x + x0 < 0.0, "{text}: its line starts off the screen");
+        }
+    }
+
+    /// A long callout is looked for as far as it may reach (the search's rings spaced out to get
+    /// there), not only near the label.
+    #[test]
+    fn a_long_callout_reaches_a_far_free_spot() {
+        // A small text by its feature at (100, 100); only spots 200 points right of it are free.
+        let text = [[95.0, 98.0, 105.0, 102.0]];
+        let free = |b: &[f32; 4]| b[0] > 300.0;
+        let (dx, _, [x0, y0, x1, y1]) = callout_spot(&text, [100.0, 100.0], 300.0, free, 1000.0, 200.0).expect("a spot");
+        assert!(dx > 195.0);
+        let len = (x1 - x0).hypot(y1 - y0);
+        assert!((150.0..=300.0).contains(&len), "{len} points");
+        // Beyond its reach, none.
+        assert!(callout_spot(&text, [100.0, 100.0], 100.0, free, 1000.0, 200.0).is_none());
+    }
+
+    /// Each label class labels every feature its clause takes, as in ArcGIS Pro (#732): a feature
+    /// two classes take gets a label from each, the class listed first placed first. A hidden
+    /// class labels none, and a clause that no longer reads takes none (#618).
     #[test]
     fn label_classes_label_their_features() {
         let mut m = Map::new("Map");

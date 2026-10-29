@@ -2345,8 +2345,7 @@ fn labels_take_a_font_by_family_name() {
     assert!(s.run("labels.fonts", &json!({})).unwrap()["fonts"].is_array());
 }
 
-/// A label class's halo takes its own colour and width, and its letters a spacing; blank and null
-/// go back to the automatic colour and the thin halo, and other settings leave them.
+/// Labels are moved by hand by feature id and put back, one class's or all; bad input is refused.
 #[test]
 fn labels_are_moved_by_command_and_reset() {
     let mut s = world();
@@ -2382,8 +2381,30 @@ fn labels_are_moved_by_command_and_reset() {
     s.run("labels.move", &json!({"layer": id, "feature": fid, "to": null})).unwrap();
     assert!(moved(&s).is_empty());
     s.run("labels.move", &json!({"layer": id, "feature": fid, "to": [1, 1]})).unwrap();
+    // A bad "all" is refused, not taken as false.
+    assert!(s.run("labels.resetMoved", &json!({"layer": id, "all": "tru"})).is_err());
+    assert_eq!(moved(&s).len(), 1);
     s.run("labels.resetMoved", &json!({"layer": id, "all": true})).unwrap();
     assert!(moved(&s).is_empty());
+    // Locked, a move locks the labels again where they are placed next: the one moved may not
+    // have been placed when the lock was taken.
+    s.run("labels.lock", &json!({"on": true})).unwrap();
+    let v = crate::render::View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera: s.map().camera, sky: false };
+    crate::render::render(s.map_mut(), &v).unwrap();
+    assert!(s.map().label_lock.is_some());
+    s.run("labels.move", &json!({"layer": id, "feature": fid, "to": [2, 2]})).unwrap();
+    assert!(s.map().label_lock.is_none() && s.map().label_display.locked, "locked again, not unlocked");
+    // Converted to annotations, a moved label's annotation is where it was put, and the
+    // annotations' classes keep none moved (their ids aren't the features').
+    s.run("labels.lock", &json!({"on": false})).unwrap();
+    let r = s.run("labels.convert", &json!({"layer": id})).unwrap();
+    let a = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap();
+    assert!(a.labels.default.moved.is_empty());
+    let at = |g: &Option<rustgis_data::Geometry>| match g {
+        Some(rustgis_data::Geometry::Point(c)) => Some([c.x, c.y]),
+        _ => None,
+    };
+    assert!(a.dataset.features.iter().any(|f| at(&f.geometry) == Some([2.0, 2.0])), "the moved one's annotation");
     // The tool by its code.
     s.run("tool.set", &json!({"tool": "moveLabel"})).unwrap();
     assert_eq!(s.tool, crate::Tool::MoveLabel);
@@ -2433,6 +2454,8 @@ fn labels_show_all_and_take_callouts() {
     assert_eq!(class(&s), (true, Some(40.0)), "undoes");
 }
 
+/// A label class's halo takes its own colour and width, and its letters a spacing; blank and null
+/// go back to the automatic colour and the thin halo, and other settings leave them.
 #[test]
 fn labels_take_a_halo_colour_and_width_and_letter_spacing() {
     use rustgis_map::Rgba;

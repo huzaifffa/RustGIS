@@ -1896,7 +1896,7 @@ pub struct LabelClass {
     pub callout: Option<f32>,
     /// Labels moved by hand (the Move Label tool, as QGIS's): each feature's, by its id, drawn
     /// where it was put, a callout's line back to the feature when the class has callouts. At
-    /// most [`MAX_MOVED_LABELS`].
+    /// most [`MAX_MOVED_LABELS`], kept in order of id (so a label's is found without a scan).
     #[serde(default, deserialize_with = "de_moved", skip_serializing_if = "Vec::is_empty")]
     pub moved: Vec<MovedLabel>,
 }
@@ -1912,53 +1912,61 @@ pub struct MovedLabel {
 /// Most labels a class keeps moved by hand.
 pub const MAX_MOVED_LABELS: usize = 10_000;
 
-/// A project file's moved labels: those with a place that is a number, one a feature (the last
-/// wins), at most [`MAX_MOVED_LABELS`].
+/// Whether `at` is a place a label can be moved to: a longitude within ±540° (a view's worth
+/// past the antimeridian either way) and a latitude within ±90°.
+pub fn is_label_place(at: [f64; 2]) -> bool {
+    let [x, y] = at;
+    x.is_finite() && y.is_finite() && x.abs() <= 540.0 && y.abs() <= 90.0
+}
+
+/// A project file's moved labels: those with a place ([`is_label_place`]), one a feature (the
+/// last wins), at most [`MAX_MOVED_LABELS`], in order of id.
 fn de_moved<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<MovedLabel>, D::Error> {
     // Read one by one, so one that isn't a moved label leaves the others (and the file) readable.
-    let all: Vec<MovedLabel> = lenient::<D, Vec<Option<serde_json::Value>>>(d)?
+    let mut by_id = std::collections::BTreeMap::new();
+    for m in lenient::<D, Vec<Option<serde_json::Value>>>(d)?
         .unwrap_or_default()
         .into_iter()
         .flatten()
-        .filter_map(|v| serde_json::from_value(v).ok())
-        .collect();
-    let mut out: Vec<MovedLabel> = Vec::new();
-    for m in all.into_iter().filter(|m| m.at.iter().all(|v| v.is_finite())) {
-        if let Some(o) = out.iter_mut().find(|o| o.id == m.id) {
-            *o = m;
-        } else if out.len() < MAX_MOVED_LABELS {
-            out.push(m);
+        .filter_map(|v| serde_json::from_value::<MovedLabel>(v).ok())
+        .filter(|m| is_label_place(m.at))
+    {
+        if by_id.len() < MAX_MOVED_LABELS || by_id.contains_key(&m.id) {
+            by_id.insert(m.id, m.at);
         }
     }
-    Ok(out)
+    Ok(by_id.into_iter().map(|(id, at)| MovedLabel { id, at }).collect())
 }
 
 impl LabelClass {
     /// Where feature `id`'s label was moved to by hand, if it was.
     pub fn moved_to(&self, id: u64) -> Option<[f64; 2]> {
-        self.moved.iter().find(|m| m.id == id).map(|m| m.at)
+        self.moved.binary_search_by_key(&id, |m| m.id).ok().and_then(|i| self.moved.get(i)).map(|m| m.at)
     }
 
     /// Keeps feature `id`'s label at `at` (longitude, latitude), or where its class puts it
-    /// again with none. False when `at` isn't a place, or the class already keeps the most.
+    /// again with none. False when `at` isn't a place ([`is_label_place`]), or the class already
+    /// keeps the most.
     pub fn move_label(&mut self, id: u64, at: Option<[f64; 2]>) -> bool {
-        match at {
-            None => {
-                self.moved.retain(|m| m.id != id);
+        let found = self.moved.binary_search_by_key(&id, |m| m.id);
+        match (at, found) {
+            (None, Ok(i)) => {
+                self.moved.remove(i);
                 true
             }
-            Some(at) if !at.iter().all(|v| v.is_finite()) => false,
-            Some(at) => {
-                if let Some(m) = self.moved.iter_mut().find(|m| m.id == id) {
+            (None, Err(_)) => true,
+            (Some(at), _) if !is_label_place(at) => false,
+            (Some(at), Ok(i)) => {
+                if let Some(m) = self.moved.get_mut(i) {
                     m.at = at;
-                    true
-                } else if self.moved.len() < MAX_MOVED_LABELS {
-                    self.moved.push(MovedLabel { id, at });
-                    true
-                } else {
-                    false
                 }
+                true
             }
+            (Some(at), Err(i)) if self.moved.len() < MAX_MOVED_LABELS => {
+                self.moved.insert(i, MovedLabel { id, at });
+                true
+            }
+            (Some(_), Err(_)) => false,
         }
     }
 }
@@ -3381,12 +3389,24 @@ mod tests {
         assert!(c.move_label(7, Some([11.0, 21.0])), "moved again, the same feature's");
         assert_eq!((c.moved_to(7), c.moved_to(8), c.moved.len()), (Some([11.0, 21.0]), Some([1.0, 2.0]), 2));
         assert!(!c.move_label(9, Some([f64::NAN, 0.0])), "not a place");
+        assert!(!c.move_label(9, Some([1000.0, 0.0])) && !c.move_label(9, Some([0.0, 95.0])), "off the map");
+        assert!(c.move_label(2, Some([0.0, 0.0])) && c.moved.windows(2).all(|w| w[0].id < w[1].id), "kept in order of id");
+        assert!(c.move_label(2, None) && c.move_label(2, None), "putting back one not moved is fine");
         assert!(c.move_label(8, None) && c.moved_to(8).is_none(), "put back");
         // Read from a file: bad entries dropped, the rest kept, a feature's last place wins.
         let mut v = serde_json::to_value(&c).unwrap();
-        v["moved"] = serde_json::json!([{"id": 1, "at": [1, 1]}, {"id": "x"}, 7, {"id": 1, "at": [2, 2]}, {"id": 3, "at": [3, 3]}]);
+        v["moved"] = serde_json::json!([{"id": 1, "at": [1, 1]}, {"id": "x"}, 7, {"id": 1, "at": [2, 2]}, {"id": 3, "at": [3, 3]}, {"id": 0, "at": [1000, 95]}]);
         let read: LabelClass = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(read.moved, vec![MovedLabel { id: 1, at: [2.0, 2.0] }, MovedLabel { id: 3, at: [3.0, 3.0] }]);
+        // Out of order in the file: put in order, so each is still found.
+        v["moved"] = serde_json::json!([{"id": 9, "at": [9, 9]}, {"id": 4, "at": [4, 4]}]);
+        let read: LabelClass = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!((read.moved_to(4), read.moved_to(9)), (Some([4.0, 4.0]), Some([9.0, 9.0])));
+        // A huge list reads quickly, and keeps the most.
+        let many: Vec<_> = (0..50_000u64).rev().map(|i| serde_json::json!({"id": i, "at": [0, 0]})).collect();
+        v["moved"] = serde_json::Value::Array(many);
+        let read: LabelClass = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(read.moved.len(), MAX_MOVED_LABELS);
         v["moved"] = serde_json::json!("nonsense");
         assert!(serde_json::from_value::<LabelClass>(v).unwrap().moved.is_empty(), "the rest still reads");
         // None moved: none saved.
