@@ -54,6 +54,15 @@ enum DragKind {
         row: usize,
         origin: Pos2,
     },
+    /// Moving a layer's label with the Move Label tool: its layer's id, its feature's id, its
+    /// label class (in the layer's labeling order) and where the press was. The label as it was
+    /// drawn is in `MapView::moving_label`.
+    Label {
+        layer: u32,
+        feature: u64,
+        class: u32,
+        origin: Pos2,
+    },
 }
 
 /// Graphic shapes drawn by dragging rather than clicking.
@@ -262,6 +271,8 @@ pub struct MapView {
     view_px: [usize; 2],
     resized_at: f64,
     drag: Option<(Pos2, DragKind)>,
+    /// The label being moved with the Move Label tool, as it was drawn when grabbed.
+    moving_label: Option<PlacedLabel>,
     sketch: Vec<Coord>,
     selection_gesture: Option<SelectionGesture>,
     radius_preview: Option<(Coord, f64, Vec<Option<Pos2>>)>,
@@ -366,6 +377,7 @@ impl Default for MapView {
             view_px: [0, 0],
             resized_at: -10.0,
             drag: None,
+            moving_label: None,
             sketch: Vec::new(),
             selection_gesture: None,
             radius_preview: None,
@@ -1404,7 +1416,44 @@ fn place_galley(anchor: Align2, at: Pos2, g: &egui::Galley) -> (Pos2, Rect) {
     (r.min - g.rect.min.to_vec2(), r)
 }
 
+/// The layer's label drawn at a point of the map view (relative to it as `rect` is), topmost first:
+/// what the Move Label tool grabs. Labels not of a layer's features aren't.
+fn label_at(app: &RustGisApp, rect: Rect, p: Pos2) -> Option<PlacedLabel> {
+    let at = p - rect.min;
+    app.map.labels.iter().rev().filter(|l| l.collide.source.is_some() && !l.text.is_empty()).find_map(|l| {
+        let e = rustgis_engine::render::label_extent(l)?;
+        let r = Rect::from_min_max(pos2(e[0], e[1]), pos2(e[2], e[3])).expand(3.0);
+        r.contains(pos2(at.x, at.y)).then(|| l.clone())
+    })
+}
+
+/// A label moved by `d` (points): its text there, its feature where it was, and its callout's line
+/// from the feature to the text when its class has callouts.
+fn moved_label(l: &PlacedLabel, d: egui::Vec2) -> PlacedLabel {
+    let mut m = l.clone();
+    m.x += d.x;
+    m.y += d.y;
+    m.collide.callout_anchor = l.collide.callout_anchor.map(|[ax, ay]| [ax - d.x, ay - d.y]);
+    m.collide.callout = rustgis_engine::render::callout_to(&m);
+    m
+}
+
+/// The name of a layer's label class by its place in the labeling order.
+fn label_class_name(app: &RustGisApp, layer: u32, class: u32) -> Option<String> {
+    app.session.map().layer(layer)?.labels.in_order().nth(class as usize).map(|c| c.name.clone())
+}
+
 fn draw_label(p: &egui::Painter, l: &PlacedLabel, at: Pos2) {
+    // A callout's line, from its feature to the edge of the text, under the text (its halo
+    // under the line, so it shows over the map).
+    if let Some([x0, y0, x1, y1]) = l.collide.callout {
+        let ends = [at + vec2(x0, y0), at + vec2(x1, y1)];
+        let width = rustgis_engine::render::CALLOUT_WIDTH;
+        if let Some(h) = l.halo {
+            p.line_segment(ends, Stroke::new(width + 2.0, crate::theme::c32(h)));
+        }
+        p.line_segment(ends, Stroke::new(width, crate::theme::c32(l.color)));
+    }
     // Curved along a line: each character turned into its place, every character's halo first,
     // so none covers the letter before it.
     if !l.glyphs.is_empty() {
@@ -2215,8 +2264,15 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             .then(|| text_graphic_at(app, ui.ctx(), rect, origin))
             .flatten()
             .filter(|hit| crate::graphicformat::selected(app) == Some(*hit));
+        // With the Move Label tool, a layer's label grabbed by its text moves; elsewhere the map pans.
+        let label = (tool == Tool::MoveLabel && !middle).then(|| label_at(app, rect, origin)).flatten();
         let kind = if let Some((layer, row)) = grabbed {
             DragKind::Text { layer, row, origin }
+        } else if let Some(l) = label
+            && let Some((layer, feature, class)) = l.collide.source
+        {
+            app.map.moving_label = Some(l);
+            DragKind::Label { layer, feature, class, origin }
         } else if middle {
             DragKind::Pan
         } else if tool == Tool::EditVertices && crate::vertexedit::drag_start(app, rect, origin) {
@@ -2256,6 +2312,33 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         } else {
             app.map.sketch.truncate(1);
             app.map.sketch.push(c);
+        }
+    }
+    // A label being moved shows where it will land, its callout's line following it; it is kept
+    // there, as one undo step, on release.
+    if let Some((_, DragKind::Label { layer, feature, class, origin })) = app.map.drag {
+        let end = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos()));
+        let moved = app.map.moving_label.clone().zip(end).map(|(l, end)| moved_label(&l, end - origin));
+        if resp.drag_stopped() {
+            app.map.drag = None;
+            app.map.moving_label = None;
+            let to = moved.and_then(|l| screen_to_lonlat(app, rect, rect.min + vec2(l.x, l.y)));
+            if let (Some(c), Some(name)) = (to, label_class_name(app, layer, class)) {
+                let _ = app.run("labels.move", json!({"layer": layer, "class": name, "feature": feature, "to": [c.x, c.y]}));
+            }
+            return;
+        }
+        if let Some(l) = moved {
+            let t = Tokens::get(ui.ctx());
+            let painter =
+                ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.scope_id().with("label_drag"))).with_clip_rect(rect);
+            draw_label(&painter, &l, rect.min + vec2(l.x, l.y));
+            if let Some(e) = rustgis_engine::render::label_extent(&l) {
+                let r = Rect::from_min_max(rect.min + vec2(e[0], e[1]), rect.min + vec2(e[2], e[3]));
+                painter.rect_stroke(r, 2.0, egui::Stroke::new(1.0, t.accent), egui::StrokeKind::Outside);
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            ui.ctx().request_repaint();
         }
     }
     // A dragged text shows where it will land; it is placed there, as one undo step, on release.
@@ -2459,6 +2542,15 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         // Sketch vertices snap to features when snapping is on.
         let c = if tool.creates() || matches!(tool, Tool::Graphic(_) | Tool::Measure | Tool::MeasureArea) { snapped(app, c) } else { c };
         match tool {
+            // Labels move by dragging them; Shift-clicking a moved one puts it back.
+            Tool::MoveLabel => {
+                if shift
+                    && let Some((layer, feature, class)) = label_at(app, rect, p).and_then(|l| l.collide.source)
+                    && let Some(name) = label_class_name(app, layer, class)
+                {
+                    let _ = app.run("labels.move", json!({"layer": layer, "class": name, "feature": feature, "to": null}));
+                }
+            }
             Tool::Explore => {
                 let r = app.session.run("identify", &json!({"lon": c.x, "lat": c.y, "tolerancePx": 5}));
                 app.map.popup = match r {
@@ -2858,6 +2950,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         }
         Tool::EditVertices => Some("Click a feature, then drag its vertices · click an edge to add one"),
         Tool::ZoomIn => Some("Drag a box or click to zoom in"),
+        Tool::MoveLabel => Some("Drag a label to where it should be · drag the map to pan · Esc to stop"),
         Tool::Graphic("point") => Some("Click the map to place a point"),
         Tool::Graphic("text") => Some("Click the map to place text"),
         Tool::Graphic("line" | "curve") => Some("Click to add vertices · double-click to finish"),

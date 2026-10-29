@@ -132,8 +132,8 @@ pub fn commands() -> Vec<C> {
         C::new("labels.placement", "Label Placement", "Labeling › Label Placement", |s, p| {
             let pos = match ps(p, "position") {
                 Some(code) => Some(LabelPlacement::from_code(code).ok_or_else(|| format!("unknown placement '{code}'"))?),
-                None if p.get("offset").is_some() || p.get("repeat").is_some() => None,
-                None => return Err("position is required (or an offset or a repeat)".into()),
+                None if ["offset", "repeat", "showAll", "callout"].iter().any(|k| p.get(k).is_some()) => None,
+                None => return Err("position is required (or an offset, a repeat, showAll or a callout)".into()),
             };
             let offset = match p.get("offset") {
                 None => None,
@@ -149,6 +149,28 @@ pub fn commands() -> Vec<C> {
                     _ => return Err("repeat must be a number of points, or 0 or null for none".into()),
                 },
             };
+            // Every label shown, over the others where they crowd.
+            let show_all = match p.get("showAll") {
+                None => None,
+                Some(v) => Some(v.as_bool().ok_or("showAll must be true or false")?),
+            };
+            // Callouts: on (true: its longest line as it was, or the default), on with this
+            // longest line (points), or off (false, 0 or null).
+            enum Callout {
+                Off,
+                On,
+                Reach(f32),
+            }
+            let callout = match p.get("callout") {
+                None => None,
+                Some(Value::Null | Value::Bool(false)) => Some(Callout::Off),
+                Some(Value::Bool(true)) => Some(Callout::On),
+                Some(v) => match number(v) {
+                    Some(0.0) => Some(Callout::Off),
+                    Some(r) if r > 0.0 => Some(rustgis_map::symbology::callout_reach(r).map_or(Callout::Off, Callout::Reach)),
+                    _ => return Err("callout must be true or false, or its longest line in points".into()),
+                },
+            };
             with_class(s, p, |c| {
                 if let Some(pos) = pos {
                     c.placement = pos;
@@ -159,12 +181,61 @@ pub fn commands() -> Vec<C> {
                 if let Some(r) = repeat {
                     c.repeat = r;
                 }
+                if let Some(a) = show_all {
+                    c.show_all = a;
+                }
+                match callout {
+                    Some(Callout::Off) => c.callout = None,
+                    Some(Callout::On) => c.callout = Some(c.callout.unwrap_or(rustgis_map::symbology::DEFAULT_CALLOUT)),
+                    Some(Callout::Reach(r)) => c.callout = Some(r),
+                    None => {}
+                }
             })
         })
         .when(need_feature_layer)
         .params(
-            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset or repeat), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only)}"#,
+            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset or repeat), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only), "showAll"?: bool (every label drawn, over the others where they crowd), "callout"?: true|false|points (5 to 500: a label crowded off its spot moves to a free one nearby, a line drawn back to its feature at most this long; true keeps its length, or 40; false, 0 or null: none; not labels along a line)}"#,
         ),
+        // Labels moved by hand (the Move Label tool, as QGIS's): kept by their feature's id.
+        C::new("labels.move", "Move Label", "Labeling › Label Placement", |s, p| {
+            let feature = p.get("feature").and_then(Value::as_u64).ok_or("feature is a feature's id")?;
+            let to = match p.get("to") {
+                None => return Err("to is [x, y] (longitude, latitude), or null to put it back".into()),
+                Some(Value::Null) => None,
+                Some(v) => {
+                    let a = v.as_array().filter(|a| a.len() == 2).ok_or("to is [x, y] (longitude, latitude)")?;
+                    let xy = [a.first().and_then(number), a.get(1).and_then(number)];
+                    match xy {
+                        [Some(x), Some(y)] if x.is_finite() && y.is_finite() && x.abs() <= 540.0 && y.abs() <= 90.0 => Some([x, y]),
+                        _ => return Err("to is [x, y]: a longitude and a latitude".into()),
+                    }
+                }
+            };
+            with_labels(s, p, |labels| {
+                let c = class_in(labels, p)?;
+                if c.move_label(feature, to) {
+                    Ok(())
+                } else {
+                    Err(format!("a label class keeps at most {} labels moved", rustgis_map::symbology::MAX_MOVED_LABELS))
+                }
+            })
+        })
+        .when(need_feature_layer)
+        .params(r#"{"layer"?, "class"?: name (none: the Default class), "feature": the feature's id, "to": [x, y] (longitude, latitude: where the label's text is centred) | null (back where its class puts it)}"#),
+        C::new("labels.resetMoved", "Reset Moved Labels", "Labeling › Label Placement", |s, p| {
+            let all = b(p, "all").unwrap_or(false);
+            with_labels(s, p, |labels| {
+                if all {
+                    labels.default.moved.clear();
+                    labels.classes.iter_mut().for_each(|c| c.moved.clear());
+                } else {
+                    class_in(labels, p)?.moved.clear();
+                }
+                Ok(())
+            })
+        })
+        .when(need_feature_layer)
+        .params(r#"{"layer"?, "class"?: name (none: the Default class), "all"?: bool (every class of the layer)}"#),
         // Label classes: each labels every feature its clause takes, as in ArcGIS Pro; the classes
         // listed first, Default last, are placed first (`Labeling`, #732).
         C::new("labels.class.add", "Add Label Class", "View › Windows › Labeling", add_class)

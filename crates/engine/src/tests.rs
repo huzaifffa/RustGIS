@@ -2344,6 +2344,92 @@ fn labels_take_a_font_by_family_name() {
 /// A label class's halo takes its own colour and width, and its letters a spacing; blank and null
 /// go back to the automatic colour and the thin halo, and other settings leave them.
 #[test]
+fn labels_are_moved_by_command_and_reset() {
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let fid = s.map().layer(id).unwrap().dataset.features.first().unwrap().id;
+    let moved = |s: &Session| s.map().layer(id).unwrap().labels.default.moved.clone();
+    s.run("labels.move", &json!({"layer": id, "feature": fid, "to": [12.5, 41.9]})).unwrap();
+    assert_eq!(moved(&s), vec![rustgis_map::symbology::MovedLabel { id: fid, at: [12.5, 41.9] }]);
+    // By the class's name too (Default's); again moves it again.
+    let name = s.map().layer(id).unwrap().labels.default.name.clone();
+    s.run("labels.move", &json!({"layer": id, "class": name, "feature": fid, "to": [13.0, 42.0]})).unwrap();
+    assert_eq!(moved(&s).len(), 1);
+    // Bad values change nothing.
+    for bad in [
+        json!({"feature": fid}),
+        json!({"feature": "one", "to": [1, 1]}),
+        json!({"feature": fid, "to": [1]}),
+        json!({"feature": fid, "to": [1, 200]}),
+        json!({"feature": fid, "to": ["a", 1]}),
+        json!({"feature": fid, "to": [1, 1], "class": "No such class"}),
+    ] {
+        let mut p = bad.clone();
+        p["layer"] = json!(id);
+        assert!(s.run("labels.move", &p).is_err(), "{bad}");
+    }
+    assert_eq!(moved(&s)[0].at, [13.0, 42.0]);
+    // Saved with the project's layer, and one undo step a move.
+    let saved = serde_json::to_value(&s.map().layer(id).unwrap().labels).unwrap();
+    assert_eq!(saved["moved"], json!([{"id": fid, "at": [13.0, 42.0]}]));
+    s.run("edit.undo", &json!({})).unwrap();
+    assert_eq!(moved(&s)[0].at, [12.5, 41.9]);
+    // Put back: one, then all.
+    s.run("labels.move", &json!({"layer": id, "feature": fid, "to": null})).unwrap();
+    assert!(moved(&s).is_empty());
+    s.run("labels.move", &json!({"layer": id, "feature": fid, "to": [1, 1]})).unwrap();
+    s.run("labels.resetMoved", &json!({"layer": id, "all": true})).unwrap();
+    assert!(moved(&s).is_empty());
+    // The tool by its code.
+    s.run("tool.set", &json!({"tool": "moveLabel"})).unwrap();
+    assert_eq!(s.tool, crate::Tool::MoveLabel);
+}
+
+#[test]
+fn labels_show_all_and_take_callouts() {
+    let mut s = world();
+    let class = |s: &Session| {
+        let c = &s.map().layer_by_name("Cities").unwrap().labels.default;
+        (c.show_all, c.callout)
+    };
+    assert_eq!(class(&s), (false, None));
+    s.run("labels.placement", &json!({"layer": "Cities", "showAll": true})).unwrap();
+    assert_eq!(class(&s), (true, None), "no position needed");
+    // On: the default length, then one given, kept within range; on again keeps it.
+    s.run("labels.placement", &json!({"layer": "Cities", "callout": true})).unwrap();
+    assert_eq!(class(&s).1, Some(rustgis_map::symbology::DEFAULT_CALLOUT));
+    s.run("labels.placement", &json!({"layer": "Cities", "callout": 80})).unwrap();
+    assert_eq!(class(&s).1, Some(80.0));
+    s.run("labels.placement", &json!({"layer": "Cities", "callout": 99999})).unwrap();
+    assert_eq!(class(&s).1, Some(500.0), "within its range");
+    s.run("labels.placement", &json!({"layer": "Cities", "callout": true})).unwrap();
+    assert_eq!(class(&s).1, Some(500.0), "on again keeps its length");
+    // Saved with the layer, and read back.
+    let saved = serde_json::to_value(&s.map().layer_by_name("Cities").unwrap().labels).unwrap();
+    assert_eq!((saved["show_all"].clone(), saved["callout"].clone()), (json!(true), json!(500.0)));
+    let back: rustgis_map::symbology::Labeling = serde_json::from_value(saved).unwrap();
+    assert_eq!((back.default.show_all, back.default.callout), (true, Some(500.0)));
+    // A project file's out-of-range length is brought within range.
+    let mut wild = serde_json::to_value(&back).unwrap();
+    wild["callout"] = json!(1e9);
+    let read: rustgis_map::symbology::Labeling = serde_json::from_value(wild).unwrap();
+    assert_eq!(read.default.callout, Some(500.0));
+    // Off, three ways; bad values change nothing.
+    for off in [json!(false), json!(0), json!(null)] {
+        s.run("labels.placement", &json!({"layer": "Cities", "callout": 40})).unwrap();
+        s.run("labels.placement", &json!({"layer": "Cities", "callout": off})).unwrap();
+        assert_eq!(class(&s).1, None, "{off}");
+    }
+    for bad in [json!({"callout": "long"}), json!({"callout": -5}), json!({"showAll": "yes"})] {
+        let mut p = bad.clone();
+        p["layer"] = json!("Cities");
+        assert!(s.run("labels.placement", &p).is_err(), "{bad}");
+    }
+    s.run("edit.undo", &json!({})).unwrap();
+    assert_eq!(class(&s), (true, Some(40.0)), "undoes");
+}
+
+#[test]
 fn labels_take_a_halo_colour_and_width_and_letter_spacing() {
     use rustgis_map::Rgba;
     let mut s = world();

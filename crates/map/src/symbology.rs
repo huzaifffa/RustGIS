@@ -1881,6 +1881,95 @@ pub struct LabelClass {
     /// the one at its middle, as QGIS's repeat distance; none is the one at its middle.
     #[serde(default, deserialize_with = "de_repeat", skip_serializing_if = "Option::is_none")]
     pub repeat: Option<f32>,
+    /// Every label drawn, over the others where they crowd, rather than some left out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_all: bool,
+    /// Callouts: a label crowded off its spot moves to a free one nearby, a line drawn from its
+    /// feature to it at most this long (points, within [`CALLOUT_REACH`]), as QGIS's callouts;
+    /// none keeps every label in its spot. Labels along lines aren't moved.
+    #[serde(default, deserialize_with = "de_callout", skip_serializing_if = "Option::is_none")]
+    pub callout: Option<f32>,
+    /// Labels moved by hand (the Move Label tool, as QGIS's): each feature's, by its id, drawn
+    /// where it was put, a callout's line back to the feature when the class has callouts. At
+    /// most [`MAX_MOVED_LABELS`].
+    #[serde(default, deserialize_with = "de_moved", skip_serializing_if = "Vec::is_empty")]
+    pub moved: Vec<MovedLabel>,
+}
+
+/// A label moved by hand: its feature's id, and where its text is centred, in the layer's
+/// coordinates (longitude and latitude), so it stays put on the map as the view moves.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MovedLabel {
+    pub id: u64,
+    pub at: [f64; 2],
+}
+
+/// Most labels a class keeps moved by hand.
+pub const MAX_MOVED_LABELS: usize = 10_000;
+
+/// A project file's moved labels: those with a place that is a number, one a feature (the last
+/// wins), at most [`MAX_MOVED_LABELS`].
+fn de_moved<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<MovedLabel>, D::Error> {
+    // Read one by one, so one that isn't a moved label leaves the others (and the file) readable.
+    let all: Vec<MovedLabel> = lenient::<D, Vec<Option<serde_json::Value>>>(d)?
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
+    let mut out: Vec<MovedLabel> = Vec::new();
+    for m in all.into_iter().filter(|m| m.at.iter().all(|v| v.is_finite())) {
+        if let Some(o) = out.iter_mut().find(|o| o.id == m.id) {
+            *o = m;
+        } else if out.len() < MAX_MOVED_LABELS {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
+impl LabelClass {
+    /// Where feature `id`'s label was moved to by hand, if it was.
+    pub fn moved_to(&self, id: u64) -> Option<[f64; 2]> {
+        self.moved.iter().find(|m| m.id == id).map(|m| m.at)
+    }
+
+    /// Keeps feature `id`'s label at `at` (longitude, latitude), or where its class puts it
+    /// again with none. False when `at` isn't a place, or the class already keeps the most.
+    pub fn move_label(&mut self, id: u64, at: Option<[f64; 2]>) -> bool {
+        match at {
+            None => {
+                self.moved.retain(|m| m.id != id);
+                true
+            }
+            Some(at) if !at.iter().all(|v| v.is_finite()) => false,
+            Some(at) => {
+                if let Some(m) = self.moved.iter_mut().find(|m| m.id == id) {
+                    m.at = at;
+                    true
+                } else if self.moved.len() < MAX_MOVED_LABELS {
+                    self.moved.push(MovedLabel { id, at });
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// How long a callout's line may be (points): from about a letter to a few centimetres of paper.
+pub const CALLOUT_REACH: std::ops::RangeInclusive<f64> = 5.0..=500.0;
+/// A callout's longest line when none is given (points).
+pub const DEFAULT_CALLOUT: f32 = 40.0;
+
+/// A callout's longest line as a class keeps it, within [`CALLOUT_REACH`]; none for no number.
+pub fn callout_reach(v: f64) -> Option<f32> {
+    v.is_finite().then(|| v.clamp(*CALLOUT_REACH.start(), *CALLOUT_REACH.end()) as f32)
+}
+
+fn de_callout<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(lenient::<D, f64>(d)?.and_then(callout_reach))
 }
 
 /// The longest wrap character kept (characters).
@@ -2286,6 +2375,9 @@ impl LabelClass {
             wrap_length: 0,
             line_align: crate::layout::TextAlign::Left,
             repeat: None,
+            show_all: false,
+            callout: None,
+            moved: Vec::new(),
         }
     }
 
@@ -3208,6 +3300,31 @@ mod tests {
         let long = format!("{} {}", "x".repeat(MAX_LABEL - 1), "y".repeat(10));
         let e = gr.set_class_style(&ClassRef::Index(0), &style(None, None, Some(&long)), g).unwrap();
         assert_eq!(e.label, "x".repeat(MAX_LABEL - 1));
+    }
+
+    #[test]
+    fn labels_are_moved_by_hand_and_put_back() {
+        let ds = rustgis_data::Dataset::new(
+            "d",
+            rustgis_data::GeometryType::Point,
+            vec![rustgis_data::Field::new("name", rustgis_data::FieldType::Text)],
+        );
+        let mut c = LabelClass::default_for(&ds);
+        assert!(c.move_label(7, Some([10.0, 20.0])) && c.move_label(8, Some([1.0, 2.0])));
+        assert!(c.move_label(7, Some([11.0, 21.0])), "moved again, the same feature's");
+        assert_eq!((c.moved_to(7), c.moved_to(8), c.moved.len()), (Some([11.0, 21.0]), Some([1.0, 2.0]), 2));
+        assert!(!c.move_label(9, Some([f64::NAN, 0.0])), "not a place");
+        assert!(c.move_label(8, None) && c.moved_to(8).is_none(), "put back");
+        // Read from a file: bad entries dropped, the rest kept, a feature's last place wins.
+        let mut v = serde_json::to_value(&c).unwrap();
+        v["moved"] = serde_json::json!([{"id": 1, "at": [1, 1]}, {"id": "x"}, 7, {"id": 1, "at": [2, 2]}, {"id": 3, "at": [3, 3]}]);
+        let read: LabelClass = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(read.moved, vec![MovedLabel { id: 1, at: [2.0, 2.0] }, MovedLabel { id: 3, at: [3.0, 3.0] }]);
+        v["moved"] = serde_json::json!("nonsense");
+        assert!(serde_json::from_value::<LabelClass>(v).unwrap().moved.is_empty(), "the rest still reads");
+        // None moved: none saved.
+        let none = serde_json::to_value(LabelClass::default_for(&ds)).unwrap();
+        assert!(none.get("moved").is_none());
     }
 
     #[test]
