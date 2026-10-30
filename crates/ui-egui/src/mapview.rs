@@ -1243,7 +1243,10 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     } else {
         let s = if globe_view { 1.0 } else { (old.res / cam.res) as f32 };
         for l in &app.map.labels {
-            draw_label(&painter, l, tex_rect.min + vec2(l.x, l.y) * s);
+            let at = tex_rect.min + vec2(l.x, l.y) * s;
+            // A callout's feature moves with the map, its text's end with the text.
+            let feature = l.collide.callout.filter(|_| s != 1.0).map(|c| tex_rect.min + vec2(l.x + c[0], l.y + c[1]) * s);
+            draw_label(&painter, &callout_from(l, at, feature), at);
         }
     }
     if app.map.hide_overlays {
@@ -2440,8 +2443,10 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         if resp.drag_stopped() {
             app.map.drag = None;
             let to = moved.and_then(|l| screen_to_lonlat(app, rect, rect.min + vec2(l.x, l.y)));
-            if let (Some(c), Some(m)) = (to, app.map.moving_label.take()) {
-                let _ = app.run("labels.move", json!({"layer": m.layer, "class": m.class, "feature": m.feature, "to": [c.x, c.y]}));
+            if let (Some(c), Some(m)) = (to, app.map.moving_label.take())
+                && let Err(e) = app.run("labels.move", json!({"layer": m.layer, "class": m.class, "feature": m.feature, "to": [c.x, c.y]}))
+            {
+                app.session.notify(e, true);
             }
             app.map.moving_label = None;
             return;
@@ -4447,10 +4452,25 @@ mod tests {
         h.step();
         drag(&mut h, false);
         assert_eq!(moved(&h).len(), 1, "the move is kept");
+        // Shift-click on the moved one: put back, and moved again by undo.
+        let pinned = h.state().map.labels.iter().find(|l| l.collide.pinned).map(|l| rect.min + vec2(l.x, l.y));
+        let shift = egui::Modifiers { shift: true, ..none };
+        let at = pinned.expect("the moved label drawn");
+        selection_pointer(&mut h, at, None, shift);
+        selection_pointer(&mut h, at, Some(true), shift);
+        selection_pointer(&mut h, at, Some(false), shift);
+        assert!(moved(&h).is_empty(), "put back");
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        assert_eq!(moved(&h).len(), 1, "undone");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !h.state().map.labels.iter().any(|l| l.collide.pinned) || h.state().map.drawing() {
+            assert!(std::time::Instant::now() < end, "labels never drawn again");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            h.step();
+        }
         // Shift-click on a label never moved: no undo step, so undo takes back the move.
         let other = h.state().map.labels.iter().find(|l| l.text == "Place 1" && !l.collide.pinned).map(|l| rect.min + vec2(l.x, l.y));
         let at = other.expect("another label drawn");
-        let shift = egui::Modifiers { shift: true, ..none };
         selection_pointer(&mut h, at, Some(true), shift);
         selection_pointer(&mut h, at, Some(false), shift);
         h.state_mut().run("edit.undo", json!({})).unwrap();

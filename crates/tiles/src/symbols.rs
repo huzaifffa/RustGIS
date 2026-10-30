@@ -97,6 +97,9 @@ pub struct Collide {
     /// Once moved off its spot, its callout's line: from its feature to the edge of its text, as
     /// offsets (points) from where the label is drawn (`x`, `y`), so it moves with the label.
     pub callout: Option<[f32; 4]>,
+    /// Locked after a callout moved it: how far (points) it stays moved from its place, its line
+    /// drawn back to its feature.
+    pub callout_offset: Option<[f32; 2]>,
     /// Moved by hand (the Move Label tool): placed where it was put, whatever is under it, and
     /// placed first, so the others keep off it.
     pub pinned: bool,
@@ -119,6 +122,7 @@ impl Default for Collide {
             callout_reach: 0.0,
             callout_anchor: None,
             callout: None,
+            callout_offset: None,
             pinned: false,
             source: None,
         }

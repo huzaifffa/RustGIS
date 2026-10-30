@@ -2454,8 +2454,12 @@ fn labels_are_moved_by_command_and_reset() {
     // A bad "all" is refused, not taken as false.
     assert!(s.run("labels.resetMoved", &json!({"layer": id, "all": "tru"})).is_err());
     assert_eq!(moved(&s).len(), 1);
+    s.run("labels.class.add", &json!({"layer": id, "name": "Named"})).unwrap();
+    s.run("labels.move", &json!({"layer": id, "class": "Named", "feature": fid, "to": [3, 3]})).unwrap();
     s.run("labels.resetMoved", &json!({"layer": id, "all": true})).unwrap();
     assert!(moved(&s).is_empty());
+    assert!(s.map().layer(id).unwrap().labels.class("Named").unwrap().moved.is_empty(), "every class's");
+    s.run("labels.class.remove", &json!({"layer": id, "class": "Named"})).unwrap();
     // Locked, a move locks the labels again where they are placed next: the one moved may not
     // have been placed when the lock was taken.
     s.run("labels.lock", &json!({"on": true})).unwrap();
@@ -2469,12 +2473,13 @@ fn labels_are_moved_by_command_and_reset() {
     s.run("labels.lock", &json!({"on": false})).unwrap();
     let r = s.run("labels.convert", &json!({"layer": id})).unwrap();
     let a = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap();
-    assert!(a.labels.default.moved.is_empty());
+    // It stays moved there under its new id, so its class's offset doesn't shift it.
     let at = |g: &Option<rustgis_data::Geometry>| match g {
         Some(rustgis_data::Geometry::Point(c)) => Some([c.x, c.y]),
         _ => None,
     };
-    assert!(a.dataset.features.iter().any(|f| at(&f.geometry) == Some([2.0, 2.0])), "the moved one's annotation");
+    let put = a.dataset.features.iter().find(|f| at(&f.geometry) == Some([2.0, 2.0])).expect("the moved one's annotation");
+    assert_eq!(a.labels.default.moved, vec![rustgis_map::symbology::MovedLabel { id: put.id, at: [2.0, 2.0] }]);
     // The tool by its code.
     s.run("tool.set", &json!({"tool": "moveLabel"})).unwrap();
     assert_eq!(s.tool, crate::Tool::MoveLabel);
@@ -2482,6 +2487,13 @@ fn labels_are_moved_by_command_and_reset() {
 
 #[test]
 fn labels_show_all_and_take_callouts() {
+    // A project file's 0 is off, as the command's is; a length is kept.
+    let ds = rustgis_data::Dataset::new("d", rustgis_data::GeometryType::Point, vec![]);
+    let mut v = serde_json::to_value(rustgis_map::LabelClass::default_for(&ds)).unwrap();
+    for (file, read) in [(json!(0), None), (json!(-3), None), (json!(30), Some(30.0))] {
+        v["callout"] = file;
+        assert_eq!(serde_json::from_value::<rustgis_map::LabelClass>(v.clone()).unwrap().callout, read);
+    }
     let mut s = world();
     let class = |s: &Session| {
         let c = &s.map().layer_by_name("Cities").unwrap().labels.default;
@@ -16738,7 +16750,7 @@ fn ogc_group_refresh_keeps_children_across_rotated_keys_and_rejects_bad_answers(
     let group = added["group"].clone();
     let ids: Vec<u32> = s.map().service_groups[0].children.iter().map(|c| c.layer).collect();
     s.run("layer.rename", &json!({"layer":ids[0], "name":"Renamed"})).unwrap();
-    s.map_mut().label_lock = Some(vec![((ids[0], 0, 0, 0), 0), ((ids[1], 0, 0, 0), 0)]);
+    s.map_mut().label_lock = Some(vec![((ids[0], 0, 0, 0), Default::default()), ((ids[1], 0, 0, 0), Default::default())]);
 
     // A rotated key changes every source address but not the collections: the children stay.
     let mut q = doc("rotated-key");

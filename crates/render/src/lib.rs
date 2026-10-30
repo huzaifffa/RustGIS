@@ -3102,7 +3102,8 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
     if !display.locked {
         map.label_lock = None;
     }
-    let lock: Option<std::collections::HashMap<rustgis_map::LabelKey, u8>> = map.label_lock.as_ref().map(|v| v.iter().copied().collect());
+    let lock: Option<std::collections::HashMap<rustgis_map::LabelKey, rustgis_map::LockedPlace>> =
+        map.label_lock.as_ref().map(|v| v.iter().copied().collect());
     // The classes of features with a label locked (any of its repeats), to pass the rest over early.
     let locked_classes: Option<std::collections::HashSet<(u32, usize, usize)>> =
         lock.as_ref().map(|k| k.keys().map(|&(l, r, c, _)| (l, r, c)).collect());
@@ -3645,7 +3646,12 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                     };
                     let line_in_view = || globe.is_some() || ctx.cull.intersects(&extents.get(row).copied().unwrap_or_else(|| g.extent()));
                     let fid = layer.dataset.features.get(row).map(|f| f.id);
-                    let moved_here = || any_moved && classes.classes_of(ds_ptr, row).any(|(_, c)| moved_to(c, fid).is_some());
+                    // (Its class's clause read only for a feature with a label moved.)
+                    let moved_here = || {
+                        any_moved
+                            && fid.is_some_and(|id| labels.in_order().any(|c| c.moved_to(id).is_some()))
+                            && classes.classes_of(ds_ptr, row).any(|(_, c)| moved_to(c, fid).is_some())
+                    };
                     if point.is_none() && !(any_along && matches!(g, Geometry::Line(_)) && line_in_view()) && !moved_here() {
                         continue;
                     }
@@ -3772,7 +3778,7 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                             };
                             let alternatives: Vec<(f32, f32)> = match lock.as_ref().and_then(|k| k.get(&key)) {
                                 Some(&won) => {
-                                    if let Some(at) = usize::from(won).checked_sub(1).and_then(|i| others().nth(i)) {
+                                    if let Some(at) = usize::from(won.place).checked_sub(1).and_then(|i| others().nth(i)) {
                                         (lx, ly) = at;
                                     }
                                     Vec::new()
@@ -3810,6 +3816,7 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
                                             0.0
                                         },
                                         callout_anchor: anchor.map(|(ax, ay)| [ax as f32 - lx, ay as f32 - ly]),
+                                        callout_offset: lock.as_ref().and_then(|k| k.get(&key)).and_then(|won| won.callout),
                                         pinned: moved.is_some(),
                                         source: fid.map(|id| (lid, id, ci as u32)),
                                         ..Default::default()
@@ -3931,7 +3938,10 @@ fn render_frame(map: &mut Map, view: &View, full_res_rasters: bool, backend: Bac
             };
             for l in label_candidates.iter_mut().map(|c| &mut c.label).chain(fixed_labels.iter_mut()) {
                 turn_with(l, &|x, y| Some(at(x, y)));
+                // A callout's feature to where it is in that view (not turned with the label).
+                let feature = l.collide.callout_anchor.map(|[ax, ay]| at(l.x + ax, l.y + ay));
                 (l.x, l.y) = at(l.x, l.y);
+                l.collide.callout_anchor = feature.map(|(fx, fy)| [fx - l.x, fy - l.y]);
                 if let Some(i) = &mut l.icon {
                     (i.x, i.y) = at(i.x, i.y);
                 }
@@ -4502,8 +4512,11 @@ fn tilt_candidate(mut c: Candidate, at: &impl Fn(f32, f32) -> Option<(f32, f32)>
     let l = &mut c.label;
     turn_with(l, at);
     let alternatives = std::mem::take(&mut c.alternatives);
+    // A callout's feature to where it is in that view (none: out of sight, and no line).
+    let feature = l.collide.callout_anchor.and_then(|[ax, ay]| at(l.x + ax, l.y + ay));
     let mut spots = std::iter::once((l.x, l.y)).chain(alternatives).filter_map(|(x, y)| at(x, y));
     (l.x, l.y) = spots.next()?;
+    l.collide.callout_anchor = feature.map(|(fx, fy)| [fx - l.x, fy - l.y]);
     if let Some(i) = &mut l.icon {
         (i.x, i.y) = at(i.x, i.y)?;
     }
@@ -4598,14 +4611,16 @@ fn halo_for(text: Rgba) -> Rgba {
 struct Placement {
     labels: Vec<PlacedLabel>,
     unplaced: Vec<PlacedLabel>,
-    /// The key of each placed label, and the place it took (0 its own, else its alternative's
-    /// number from 1).
-    keys: Vec<(rustgis_map::LabelKey, u8)>,
+    /// The key of each placed label, and the place it took.
+    keys: Vec<(rustgis_map::LabelKey, rustgis_map::LockedPlace)>,
 }
 
 /// Labels a placement looks for a callout's spot for, at most (each looks at up to a few thousand
 /// spots).
 const MAX_CALLOUT_SEARCHES: usize = 500;
+
+/// Spots a placement tries for its callouts at most, all its searches together.
+const MAX_CALLOUT_SPOTS: usize = 200_000;
 
 /// A label's text's extent (points, `[x0, y0, x1, y1]`), as placement keeps it clear of the
 /// others: what the Move Label tool picks it by.
@@ -4652,6 +4667,7 @@ fn callout_spot(
     free: impl Fn(&[f32; 4]) -> bool,
     w: f32,
     h: f32,
+    spots: &mut usize,
 ) -> Option<(f32, f32, [f32; 4])> {
     let ext = boxes_extent(text)?;
     if !(anchor[0].is_finite() && anchor[1].is_finite() && reach.is_finite()) {
@@ -4678,7 +4694,14 @@ fn callout_spot(
             // The line ends at the text's nearest edge; text over the feature hides it.
             let to = [anchor[0].clamp(e[0], e[2]), anchor[1].clamp(e[1], e[3])];
             let len = (to[0] - anchor[0]).hypot(to[1] - anchor[1]);
-            if len > reach || len < 1.0 || best.is_some_and(|b| len >= b.0) || !text.iter().all(|b| free(&moved(b))) {
+            if len > reach || len < 1.0 || best.is_some_and(|b| len >= b.0) {
+                continue;
+            }
+            if *spots == 0 {
+                return best.map(|(_, dx, dy, line)| (dx, dy, line));
+            }
+            *spots -= 1;
+            if !text.iter().all(|b| free(&moved(b))) {
                 continue;
             }
             best = Some((len, dx, dy, [anchor[0], anchor[1], to[0], to[1]]));
@@ -4715,7 +4738,7 @@ fn place_labels(cands: impl IntoIterator<Item = impl Into<Candidate>>, fixed: Ve
     let mut out = Placement { labels: fixed, unplaced: Vec::new(), keys: Vec::new() };
     let outside = |b: &[f32; 4]| b[2] < 0.0 || b[3] < 0.0 || b[0] > w || b[1] > h;
     // Callout searches a placement makes at most: a crowded view stays quick.
-    let mut searches = MAX_CALLOUT_SEARCHES;
+    let (mut searches, mut spots) = (MAX_CALLOUT_SEARCHES, MAX_CALLOUT_SPOTS);
     for Candidate { label: mut l, key, alternatives, .. } in cands.into_iter().take(20_000) {
         let c = l.collide;
         let (has_text, has_icon) = (!l.text.is_empty(), l.icon.is_some());
@@ -4744,7 +4767,21 @@ fn place_labels(cands: impl IntoIterator<Item = impl Into<Candidate>>, fixed: Ve
         (l.x, l.y) = (x, y);
         l.collide.callout = None;
         let relative = |l: &PlacedLabel, line: [f32; 4]| [line[0] - l.x, line[1] - l.y, line[2] - l.x, line[3] - l.y];
-        if c.pinned {
+        let mut moved_by = None;
+        if let (true, Some([dx, dy])) = (locked && !c.pinned, c.callout_offset) {
+            // Locked after a callout moved it: there again, with its line.
+            l.x += dx;
+            l.y += dy;
+            for b in &mut text {
+                *b = [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy];
+            }
+            moved_by = Some([dx, dy]);
+            if let Some(f) = feature
+                && let Some(line) = callout_line(&text, f)
+            {
+                l.collide.callout = Some(relative(&l, line));
+            }
+        } else if c.pinned {
             // Moved by hand: where it was put, a callout's line back to its feature when its class
             // has callouts (however long: it was put there).
             if let Some(f) = feature.filter(|_| c.callout_reach > 0.0)
@@ -4764,7 +4801,8 @@ fn place_labels(cands: impl IntoIterator<Item = impl Into<Candidate>>, fixed: Ve
             // nearest free spot within its reach, a line drawn back to its feature. With no such
             // spot it stays, and is left out, or shown over the others when its class shows all.
             searches -= 1;
-            if let Some((dx, dy, line)) = callout_spot(&text, f, c.callout_reach, |b| !grid.hits(b), w, h) {
+            if let Some((dx, dy, line)) = callout_spot(&text, f, c.callout_reach, |b| !grid.hits(b), w, h, &mut spots) {
+                moved_by = Some([dx, dy]);
                 l.x += dx;
                 l.y += dy;
                 for b in &mut text {
@@ -4793,7 +4831,7 @@ fn place_labels(cands: impl IntoIterator<Item = impl Into<Candidate>>, fixed: Ve
             l.icon = None;
         }
         out.labels.push(l);
-        out.keys.push((key, u8::try_from(i).unwrap_or(u8::MAX)));
+        out.keys.push((key, rustgis_map::LockedPlace { place: u8::try_from(i).unwrap_or(u8::MAX), callout: moved_by }));
     }
     out
 }
@@ -5332,7 +5370,8 @@ mod tests {
         // The first free one, past one that is taken too.
         let p = place_labels(vec![blocker(), taken(vec![(104.0, 20.0), (300.0, 20.0), (300.0, 100.0)])], Vec::new(), 400.0, 200.0, false);
         assert_eq!(at(&p)[1], ("Taken".to_string(), 300.0, 20.0));
-        assert_eq!(p.keys, [((u32::MAX, 0, 0, 0), 0), ((1, 0, 0, 0), 2)], "the place it took, for a lock");
+        let place = |place| rustgis_map::LockedPlace { place, callout: None };
+        assert_eq!(p.keys, [((u32::MAX, 0, 0, 0), place(0)), ((1, 0, 0, 0), place(2))], "the place it took, for a lock");
         assert!(p.unplaced.is_empty());
         // All taken: unplaced once, where it would have gone.
         let p = place_labels(vec![blocker(), taken(vec![(104.0, 20.0), (96.0, 22.0)])], Vec::new(), 400.0, 200.0, false);
@@ -5717,12 +5756,84 @@ mod tests {
         // A small text by its feature at (100, 100); only spots 200 points right of it are free.
         let text = [[95.0, 98.0, 105.0, 102.0]];
         let free = |b: &[f32; 4]| b[0] > 300.0;
-        let (dx, _, [x0, y0, x1, y1]) = callout_spot(&text, [100.0, 100.0], 300.0, free, 1000.0, 200.0).expect("a spot");
+        let (dx, _, [x0, y0, x1, y1]) = callout_spot(&text, [100.0, 100.0], 300.0, free, 1000.0, 200.0, &mut 100_000).expect("a spot");
         assert!(dx > 195.0);
         let len = (x1 - x0).hypot(y1 - y0);
         assert!((150.0..=300.0).contains(&len), "{len} points");
         // Beyond its reach, none.
-        assert!(callout_spot(&text, [100.0, 100.0], 100.0, free, 1000.0, 200.0).is_none());
+        assert!(callout_spot(&text, [100.0, 100.0], 100.0, free, 1000.0, 200.0, &mut 100_000).is_none());
+        // The placement's spots used up: it stops looking, and says how many it tried.
+        let mut spots = 5;
+        assert!(callout_spot(&text, [100.0, 100.0], 300.0, free, 1000.0, 200.0, &mut spots).is_none());
+        assert_eq!(spots, 0);
+    }
+
+    /// Two points close together: the second label moves off by a callout. Locked, it keeps that
+    /// place and its line, as the map moves too (it went back onto the first, without its line).
+    #[test]
+    fn a_lock_keeps_a_label_where_its_callout_moved_it() {
+        let mut m = Map::new("Map");
+        let mut d = Dataset::new("pts", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        d.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("First place".into())]);
+        d.push(Some(Geometry::Point(Coord::new(0.01, 0.0))), vec![Value::Text("Second place".into())]);
+        let id = m.add_dataset(d);
+        let l = m.layer_mut(id).unwrap();
+        l.labels.enabled = true;
+        l.labels.default.callout = Some(60.0);
+        let at = |x: f64| {
+            let camera = Camera { center: lonlat_to_merc(Coord::new(x, 0.0)), res: 500.0, bearing: 0.0, pitch: 0.0 };
+            View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false }
+        };
+        let placed = |m: &mut Map, view: &View| {
+            let mut labels = render(m, view).unwrap().labels;
+            labels.sort_by(|a, b| a.text.cmp(&b.text));
+            labels
+        };
+        let free = placed(&mut m, &at(0.0));
+        assert_eq!(free.len(), 2);
+        let line = free.iter().filter_map(|l| l.collide.callout).next().expect("one moved off by a callout");
+        // Locked: the same places and line, frame after frame.
+        m.label_display.locked = true;
+        for _ in 0..2 {
+            let locked = placed(&mut m, &at(0.0));
+            assert_eq!(locked.len(), 2);
+            for (a, b) in free.iter().zip(&locked) {
+                assert!((a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01, "{}: ({}, {}) to ({}, {})", a.text, a.x, a.y, b.x, b.y);
+            }
+            assert_eq!(locked.iter().filter_map(|l| l.collide.callout).next(), Some(line));
+        }
+        // The map panned: the two labels stay as far apart, the line the same.
+        let panned = placed(&mut m, &at(0.02));
+        assert_eq!(panned.len(), 2);
+        let apart = |l: &[PlacedLabel]| (l[1].x - l[0].x, l[1].y - l[0].y);
+        let (a, b) = (apart(&free), apart(&panned));
+        assert!((a.0 - b.0).abs() < 0.5 && (a.1 - b.1).abs() < 0.5, "{a:?} {b:?}");
+        assert_eq!(panned.iter().filter_map(|l| l.collide.callout).next(), Some(line));
+    }
+
+    /// On a turned or tilted map a callout's line starts at its feature there too, not where the
+    /// north-up frame had it.
+    #[test]
+    fn a_callout_starts_at_its_feature_on_a_turned_map() {
+        let mut m = Map::new("Map");
+        let mut d = Dataset::new("pts", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        d.push(Some(Geometry::Point(Coord::new(2.35, 48.85))), vec![Value::Text("Paris".into())]);
+        let id = m.add_dataset(d);
+        let fid = m.layer(id).unwrap().dataset.features.first().unwrap().id;
+        let l = m.layer_mut(id).unwrap();
+        l.labels.enabled = true;
+        l.labels.default.callout = Some(40.0);
+        assert!(l.labels.default.move_label(fid, Some([3.5, 49.5])));
+        for (bearing, pitch) in [(40.0, 0.0), (0.0, 40.0), (40.0, 30.0)] {
+            let camera = Camera { center: lonlat_to_merc(Coord::new(2.9, 49.1)), res: 1000.0, bearing, pitch };
+            let view = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+            let labels = render(&mut m, &view).unwrap().labels;
+            let l = labels.iter().find(|l| l.text == "Paris").expect("drawn");
+            let [x0, y0, ..] = l.collide.callout.expect("a line back to Paris");
+            let (px, py) = view.to_screen(m.to_map(Coord::new(2.35, 48.85)).unwrap());
+            let off = (f64::from(l.x + x0) - px).hypot(f64::from(l.y + y0) - py);
+            assert!(off < 1.0, "bearing {bearing}, pitch {pitch}: {off} points off");
+        }
     }
 
     /// Each label class labels every feature its clause takes, as in ArcGIS Pro (#732): a feature
@@ -5821,7 +5932,7 @@ mod tests {
         // Locked, it stays there as the map moves.
         m.label_display.locked = true;
         assert_eq!(labels(&mut m, &flat), placed);
-        assert!(m.label_lock.as_ref().is_some_and(|k| k.iter().any(|(_, i)| *i > 0)), "{:?}", m.label_lock);
+        assert!(m.label_lock.as_ref().is_some_and(|k| k.iter().any(|(_, i)| i.place > 0)), "{:?}", m.label_lock);
         let moved = labels(&mut m, &view(0.0, 0.0, Coord::new(2.6, 48.85)));
         let apart = |l: &[(f32, f32, f32)]| (l[1].1 - l[0].1, l[1].2 - l[0].2);
         assert_eq!(moved.len(), 2);

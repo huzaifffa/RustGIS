@@ -1982,7 +1982,8 @@ pub fn callout_reach(v: f64) -> Option<f32> {
 }
 
 fn de_callout<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
-    Ok(lenient::<D, f64>(d)?.and_then(callout_reach))
+    // (0 turns callouts off, as the command has it; a negative isn't a length either.)
+    Ok(lenient::<D, f64>(d)?.filter(|v| *v > 0.0).and_then(callout_reach))
 }
 
 /// The longest wrap character kept (characters).
@@ -3402,7 +3403,7 @@ mod tests {
         v["moved"] = serde_json::json!([{"id": 9, "at": [9, 9]}, {"id": 4, "at": [4, 4]}]);
         let read: LabelClass = serde_json::from_value(v.clone()).unwrap();
         assert_eq!((read.moved_to(4), read.moved_to(9)), (Some([4.0, 4.0]), Some([9.0, 9.0])));
-        // A huge list reads quickly, and keeps the most.
+        // A huge list reads quickly, and keeps the first the file lists, up to the most kept.
         let many: Vec<_> = (0..50_000u64).rev().map(|i| serde_json::json!({"id": i, "at": [0, 0]})).collect();
         v["moved"] = serde_json::Value::Array(many);
         let read: LabelClass = serde_json::from_value(v.clone()).unwrap();
