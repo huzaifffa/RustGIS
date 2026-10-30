@@ -191,14 +191,17 @@ pub fn show(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, tokens: &[&
             let list = egui::ComboBox::from_id_salt(id.with("font"))
                 .selected_text(shown)
                 .height(320.0)
+                .close_behavior(crate::labelpane::SEARCHED_LIST_CLOSES)
                 .show_ui(ui, |ui| {
                     // Sans-serif and Serif first, then the installed families, found by typing.
                     let search =
                         if installed.is_some() { crate::labelpane::list_search(ui, search_id, tl!("Search fonts")) } else { String::new() };
                     for v in FontFamily::ALL {
-                        if ui.selectable_label(name.is_none() && *fam == v, tl!(v.label())).clicked() && (name.is_some() || *fam != v) {
-                            (*fam, *name) = (v, None);
-                            out.font = true;
+                        if ui.selectable_label(name.is_none() && *fam == v, tl!(v.label())).clicked() {
+                            if name.is_some() || *fam != v {
+                                (*fam, *name) = (v, None);
+                                out.font = true;
+                            }
                             crate::labelpane::end_search(ui, search_id);
                         }
                     }
