@@ -15,7 +15,7 @@ Formats](data-formats.md).
 | FlatGeobuf (`.fgb`) | Yes | Yes (`share.exportLayer`) |
 | KML/KMZ (with their styles), GPX | Yes | Yes |
 | Spreadsheets (`.xlsx`, `.xls`, `.ods`), GeoRSS feeds, LandXML, encoded polylines | Yes | No |
-| GML, MapInfo MIF/MID, OpenStreetMap PBF, TopoJSON, AutoCAD DXF (ASCII) | Yes | No |
+| GML, MapInfo MIF/MID, OpenStreetMap PBF, TopoJSON, CityJSON (footprints with heights), AutoCAD DXF (ASCII) | Yes | No |
 | LiDAR point clouds: LAS, LAZ, COPC (an evenly spread sample) | Yes | No |
 | Geotagged photos (JPEG with EXIF GPS): points with their thumbnails | Yes | No |
 | Esri File Geodatabase (`.gdb` folder; 3D multipatches as footprints) | Yes (desktop) | No |
@@ -74,8 +74,9 @@ and S-JTSK, the same built-in Helmert datum transformation as the EPSG definitio
 transformation in the file takes precedence. RDN2008 and IGM95 are treated as WGS 84-like
 datums. These transformations do not replace regional grid corrections for survey accuracy. An
 unrecognized datum keeps its ellipsoid and produces a notice when no transformation is
-available. Swiss oblique Mercator and the standard Krovak East/North variant are supported from
-their parameters.
+available. Swiss oblique Mercator, the standard Krovak East/North variant, and the oblique
+Mercator, Cassini-Soldner, polyconic and Equal Earth methods are supported from their
+parameters.
 
 Shapefile text uses a supported `.cpg` encoding, otherwise the `.dbf` code page, with UTF-8 as
 the fallback. Keep the sidecar files together.
@@ -92,7 +93,10 @@ For an editable feature layer, double-click a cell to change it. The table's too
 fields, calculates field [expressions](expressions.md) and opens **Calculate Geometry** (`edit.calculateGeometry`).
 The geometry calculator fills a new double field or an existing numeric field with area,
 perimeter, length or point X/Y, for all or selected features. Point coordinates can be WGS 84
-degrees or a supported projected EPSG system's units. See [Editing](editing.md) for field
+degrees or a supported projected EPSG system's units. Areas, perimeters and lengths measure on
+the WGS 84 ellipsoid, with the exceptions for full-turn and polar rings listed under
+[Geoprocessing](analysis.md#geoprocessing-tools).
+See [Editing](editing.md) for field
 calculations and data-design rules. Streamed layers must first be loaded with **Load All
 Features**.
 
@@ -767,12 +771,31 @@ The record directory and R-tree stay on disk, with an 8 MiB SQLite page-cache ta
 index and memory mapping disabled. Query results retain file order and the same sampling
 rules. Attributes and the `.prj` are still read from the source files.
 
-Set `RUSTGIS_SHP_CACHE` to choose the cache directory and `RUSTGIS_SHP_CACHE_MIB` to choose
-the retained index budget (2048 MiB by default, clamped to 64–65536 MiB). Idle indexes are
-evicted in least-recently-used order. Open readers and builders hold operating-system leases,
-so another instance cannot evict their indexes; active files can temporarily exceed the
-budget. An index larger than the budget is session-only. Cache checkout and release reclaim
-abandoned builds and temporary indexes. A corrupt cache is rebuilt, and an unavailable cache
+The indexes are kept in the `shp-index` folder of the RustGIS cache directory:
+`~/Library/Caches/RustGIS/shp-index` on macOS, `~/.cache/rustgis/shp-index` on Linux
+(`$XDG_CACHE_HOME`), `%LOCALAPPDATA%\RustGIS\cache\shp-index` on Windows, or under
+`RUSTGIS_CACHE_DIR` when it is set. Set
+`RUSTGIS_SHP_CACHE` to choose another directory, `RUSTGIS_SHP_CACHE_MIB` to choose the
+retained index budget (2048 MiB by default, clamped to 64–65536 MiB), and
+`RUSTGIS_SHP_CACHE_DAYS` to choose how long an unused index is kept (30 days by default,
+clamped to 1–3650). The cache is disposable: each index is rebuilt the next time its Shapefile
+is opened. **Empty Index Cache** (`cache.emptyIndexes`, from command search, a script or the
+CLI) removes every index not in use, in the cache folder and its fallback, and reports how many
+indexes and bytes it freed. A notice names what it kept: the indexes of open layers, here or in
+another RustGIS window, and files it couldn't remove, without a readable lease or refused by the
+system; and a folder it couldn't empty, without stopping at it. With RustGIS closed, the folder
+can also be deleted by hand.
+
+Idle indexes are evicted in least-recently-used order. Open readers and builders hold
+operating-system leases, so another instance cannot evict their indexes; active files can
+temporarily exceed the budget. An index larger than the budget is session-only. Building an
+index, even one that fails, reclaims abandoned builds and temporary indexes, evicts idle ones
+past the budget, and drops idle indexes unused for longer than the limit (of a file deleted or
+moved, for example). A build that is kept also drops the idle indexes of the same Shapefile
+from before it changed. Reopening a cached index leaves the cache as it is, and releasing one
+removes only its own temporary index. Otherwise a release sweeps the folder only while indexes
+in use keep the cache over budget and releasing them can bring it back within budget. A
+corrupt cache is rebuilt, and an unavailable cache
 directory falls back to the system temporary directory (a per-user directory on Unix).
 New Unix cache directories are created with mode `0700`. Existing roots must belong to
 the effective user, forbid group/other writes, and have trusted parents; symlink roots
@@ -784,22 +807,43 @@ index. Deleting idle cache files does not modify the dataset.
 On the desktop, a GeoJSON FeatureCollection larger than 32 MB is read the same way, with no size
 limit: opening reads the file once, keeping each feature's place in it and its bounding box (a
 file over 256 MB through a buffer, so it is never held whole), and each view parses just the
-features it shows. A single feature, a bare geometry or TopoJSON is loaded whole.
+features it shows. A single feature, a bare geometry, TopoJSON or CityJSON is loaded whole.
 
 A streamed layer works like any other for symbology, labels, pop-ups, selection and the
-attribute table (which lists the features read for the view). Geoprocessing tools, exports and
-**Load All Features** read the whole source, up to 2 million features (500,000 in the web app;
-a source that doesn't report its feature count must have fewer than that, since a read that
-reaches the limit is refused); a larger source is refused rather than processed as a sample. A
-GeoPackage, GeoParquet, FlatGeobuf or LAS/LAZ file is refused the same way when added without
-streaming (`layer.addData` with `"stream": false`) or given to a geoprocessing tool as a file
-path. If the source's feature count is known, an oversized whole read is refused before reading
-its features; an incomplete read is an error, not a successful sample. A tool given a
-streamed layer with a selection uses the selected features read for the view. Edits are refused,
-since the features are read again as the view moves: right-click the
+attribute table (which lists the features read for the view). On the desktop, **Export Features**
+(`share.exportLayer`) of a GeoPackage, FlatGeobuf, GeoParquet or Shapefile read in place to
+GeoJSON, CSV, FlatGeobuf, GeoPackage or GeoParquet reads the source a chunk at a time, putting
+each chunk in the output's coordinate system and writing it before reading the next: the layer
+is never held whole. What stays in memory is a chunk and what the source and the output keep: a
+GeoParquet source one row group at a time (memory grows with its largest row group), a FlatGeobuf
+output a small index entry for each feature. A source read by its web address is exported whole,
+as below.
+Geoprocessing tools, other exports and
+**Load All Features** read the whole source. A GeoPackage, FlatGeobuf or GeoParquet file, or a
+Shapefile read in place, is read a chunk at a time, with no limit on its feature count, up to
+4 GiB of features in memory (1 GiB in the web app). Other sources (a large GeoJSON read in
+place, LAS/LAZ, databases, a file by its web address) are read at once, up to 2 million features
+(500,000 in the web app; a source that doesn't report its feature count must have fewer than
+that, since a read that reaches the limit is refused). A source past its limit, memory or
+count, is refused rather than processed as a sample, and these limits also apply to a file added
+without streaming (`layer.addData` with `"stream": false`) or given to a geoprocessing tool as a
+file path (a Shapefile so added goes through the Shapefile reader and its file-size limit). An
+incomplete read is an error, not a successful sample. In the web app, a GeoParquet or FlatGeobuf
+file read in place by its web address isn't read whole: download it to load it. A tool given a
+streamed layer with a selection uses the selected features read for the view.
+
+Edits are refused, since the features are read again as the view moves: right-click the
 layer in Layers and choose **Load All Features** (`layer.loadAll`) to load it into memory and
 edit it. Projects save the layer's file path, not its features, and read the file again when they
 open; a browser upload is kept in the project.
+
+LiDAR (LAS/LAZ, including COPC) keeps at most 2 million points on the desktop or 500,000 in the
+browser as a display sample, evenly spread across the points read. LAZ (including COPC) reads
+only the first 400 million points on the desktop or 40 million in the browser; later points
+are not read. The layer retains the file's original point count; zooming does not recover
+points omitted from the sample. Whole-layer tools, exports and **Load All Features** refuse
+clouds over 2 million points on the desktop or 500,000 in the browser. Use a smaller extract
+to process all its points.
 
 | File | Features | A view read |
 | --- | --- | --- |
@@ -869,8 +913,9 @@ as RGB; other YCbCr and CMYK images aren't read. A rotated or skewed image is re
 north-up grid as it is read. The coordinate system is an EPSG code,
 or the file's own projection described in its GeoKeys (Albers, Lambert conformal conic, transverse
 Mercator, Mercator, Lambert azimuthal, stereographic, equirectangular, sinusoidal and others), which an
-exported GeoTIFF keeps. A raster too large to hold in memory (more than 120 million samples, 32
-million in the web app) opens from its largest overview that fits; one without overviews opens as
+exported GeoTIFF keeps. A raster too large to hold in memory (more than 120 million samples, or
+more on a computer with more memory, see Environments in the analysis guide; 32 million in the
+web app) opens from its largest overview that fits; one without overviews opens as
 an overview made as it is read, a strip or tile at a time (every second, fourth… pixel each way),
 so reading it takes as long as decoding the whole file once. A cloud-optimised GeoTIFF added by its
 web address is read in place instead, a tile at a time (see [Files on the

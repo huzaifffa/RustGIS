@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::RustGisApp;
 
-const MAX_PREF_BYTES: usize = 100_000;
+pub(crate) const MAX_PREF_BYTES: usize = 100_000;
 const MAX_PREF_CHANGES: usize = 1_000;
 const MAX_COMMAND_LEN: usize = 200;
 
@@ -61,6 +61,8 @@ pub const MAP_TOOLS: &[(&str, &str)] = &[
     ("createLine", "Create Line"),
     ("createPolygon", "Create Polygon"),
     ("editVertices", "Edit Vertices"),
+    ("cutPolygon", "Cut Polygon"),
+    ("reshape", "Reshape"),
 ];
 
 /// Labels of the `ui.*` commands that have a shortcut but no entry in Command Search.
@@ -197,13 +199,13 @@ impl Binding {
 
 /// One user change to the defaults, stored in preferences.
 #[derive(Serialize, Deserialize)]
-struct Change {
-    keys: String,
-    command: String,
+pub(crate) struct Change {
+    pub(crate) keys: String,
+    pub(crate) command: String,
     #[serde(default)]
-    params: Value,
+    pub(crate) params: Value,
     #[serde(default)]
-    remove: bool,
+    pub(crate) remove: bool,
 }
 
 /// Every shortcut.

@@ -28,6 +28,7 @@ fn replacement(p: &Value) -> Result<String, String> {
     Ok(full)
 }
 
+/// Reopens linked data after compatibility checks; undo restores the source and any reset label moves.
 fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {
@@ -85,8 +86,29 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
                         l.name
                     ));
                 }
+                // Classes by an expression that reads on the old fields must read on the new ones.
+                if let Some(e) = l.renderer.expression().filter(|e| rustgis_data::query::parse(e, &l.dataset).is_ok())
+                    && let Err(why) =
+                        rustgis_data::query::parse(e, &rustgis_data::Dataset::new("", info.geometry_type, info.fields.clone()))
+                {
+                    return Err(format!(
+                        "{full} doesn't fit {}'s symbology, which classes by `{e}` ({why}): choose a file that has its fields",
+                        l.name
+                    ));
+                }
             }
-            s.map_mut().layer_mut(id).ok_or("the layer no longer exists")?.replace_source(new);
+            let l = s.map_mut().layer_mut(id).ok_or("the layer no longer exists")?;
+            let moved = l.replace_source(new);
+            let name = l.name.clone();
+            // A lock's feature ids and callout offsets belong to the old source too.
+            s.map_mut().label_lock = None;
+            s.map_mut().label_lock_line_anchors.clear();
+            if moved > 0 {
+                s.notify(
+                    format!("{moved} saved label move(s) reset in {name}: replacement data may reuse feature ids; undo restores them"),
+                    false,
+                );
+            }
         }
         Ok(json!({"layer": id, "path": full, "table": s.map().layer(id).and_then(|l| l.linked_table())}))
     }

@@ -64,7 +64,7 @@ machine; remote features, such as web data and AI providers, send requests over 
 
 | | **RustGIS** | **GeoLibre** | **QGIS** | **ArcGIS Pro** | **ArcGIS Online** |
 |---|---|---|---|---|---|
-| **Format breadth** | GeoJSON, CSV, Shapefile, GeoPackage (desktop export), GeoParquet, FlatGeobuf, KML/KMZ and GPX in and out; GML, MapInfo MIF, OSM PBF, TopoJSON, DXF, GeoRSS, LandXML, LiDAR and spreadsheets in; File Geodatabase feature classes and tables read natively, with limits; GeoTIFF/COG, ASCII grids and georeferenced PNG/JPEG; WKT out; optional GDAL and DuckDB programs extend access on desktop | Wide: DuckDB-WASM Spatial plus in-house readers | **Widest**: everything GDAL/OGR reads | Very wide, plus native Esri formats | Common upload formats |
+| **Format breadth** | GeoJSON, CSV, Shapefile, GeoPackage (desktop export), GeoParquet, FlatGeobuf, KML/KMZ and GPX in and out; GML, MapInfo MIF, OSM PBF, TopoJSON, CityJSON, DXF, GeoRSS, LandXML, LiDAR and spreadsheets in; File Geodatabase feature classes and tables read natively, with limits; GeoTIFF/COG, ASCII grids and georeferenced PNG/JPEG; WKT out; optional GDAL and DuckDB programs extend access on desktop | Wide: DuckDB-WASM Spatial plus in-house readers | **Widest**: everything GDAL/OGR reads | Very wide, plus native Esri formats | Common upload formats |
 | **Cloud-native data** | GeoParquet, FlatGeobuf, PMTiles and cloud-optimised GeoTIFF read in place, large files and web addresses alike (by address, over HTTP byte ranges: a COG reads only the tiles the view needs, a FlatGeobuf only its index and the features in view, a GeoParquet its footer and the row groups in view, desktop and web), Zarr 2 and 3 stores (the chunks of the step picked, desktop and web), from `s3://` buckets too (private ones signed with a connection's keys, S3-compatible services by endpoint) | GeoParquet, FlatGeobuf, PMTiles, COG, Zarr, streamed over HTTP | GeoParquet, FlatGeobuf, PMTiles, COG, Zarr | GeoParquet, COG, Zarr | Hosted layers |
 | **Web maps and tiles** | XYZ/TMS/WMS raster tiles, WMTS, OGC API Tiles, Mapbox Vector Tiles, MapLibre styles | XYZ, WMS/WFS/WMTS, OGC API, vector tiles, MapLibre styles | Full OGC support, vector tiles | Full OGC support | Yes |
 | **Coordinate systems** | Rasters in any EPSG code, reprojected on the fly; the map in presets or projected EPSG and ESRI codes | Reprojects on import, EPSG catalog | Full PROJ support | Full support | Web Mercator focus |
@@ -137,7 +137,7 @@ Stated plainly, so the tables above are worth trusting:
 
 - **Format breadth.** MySQL/MariaDB and SQL Server/Azure SQL are read only;
   PostGIS and GeoPackage support table write-back on desktop. Live database connections and
-  DuckDB files are desktop only. The web app doesn't write GeoPackages.
+  DuckDB files are desktop only. The web app doesn't write GeoPackages or FlatGeobufs.
   The native File Geodatabase reader is 2D and does not read compressed tables,
   raster fields or sparse row layouts; GDAL can fill these gaps on desktop. DWG and rasters
   such as JPEG 2000, NetCDF and HDF also need GDAL. SQL queries need DuckDB; both are external programs.
