@@ -3395,8 +3395,15 @@ fn labels_are_moved_by_command_and_reset() {
     let v = crate::render::View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera: s.map().camera, sky: false };
     crate::render::render(s.map_mut(), &v).unwrap();
     assert!(s.map().label_lock.is_some());
+    // With nothing moved, Reset Moved changes nothing and the lock holds.
+    s.run("labels.resetMoved", &json!({"layer": id, "all": true})).unwrap();
+    assert!(s.map().label_lock.is_some(), "a reset with nothing moved keeps the lock");
     s.run("labels.move", &json!({"layer": id, "feature": fid, "to": [2, 2]})).unwrap();
     assert!(s.map().label_lock.is_none() && s.map().label_display.locked, "locked again, not unlocked");
+    // A move to where the label already is changes nothing either.
+    crate::render::render(s.map_mut(), &v).unwrap();
+    s.run("labels.move", &json!({"layer": id, "feature": fid, "to": [2, 2]})).unwrap();
+    assert!(s.map().label_lock.is_some(), "a move that changes nothing keeps the lock");
     // Converted to annotations, a moved label's annotation is where it was put, and the
     // annotations' classes keep none moved (their ids aren't the features').
     s.run("labels.lock", &json!({"on": false})).unwrap();

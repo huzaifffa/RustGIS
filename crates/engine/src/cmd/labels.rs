@@ -274,9 +274,8 @@ pub fn commands() -> Vec<C> {
             if pruned > 0 {
                 s.notify(format!("{pruned} saved label move(s) of features no longer in the layer dropped to make room"), false);
             }
-            // Locked, the labels are locked again where they are placed next: the one moved may
-            // not have been placed when the lock was taken.
-            s.map_mut().label_lock = None;
+            // Locked, the labels are locked again where they are placed next (`with_labels`: the
+            // moves changed), as the one moved may not have been placed when the lock was taken.
             Ok(r)
         })
         .when(need_feature_layer)
@@ -295,8 +294,8 @@ pub fn commands() -> Vec<C> {
                 }
                 Ok(())
             })?;
-            // As after a move: those put back are locked again where they are placed next.
-            s.map_mut().label_lock = None;
+            // As after a move, those put back are locked again where they are placed next; with
+            // nothing moved, nothing changes and the lock holds (`with_labels`).
             Ok(r)
         })
         .when(need_feature_layer)

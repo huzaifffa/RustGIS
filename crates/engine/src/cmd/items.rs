@@ -117,7 +117,7 @@ pub fn commands() -> Vec<C> {
                 s.map_mut().label_lock_line_anchors.clear();
             }
             if foreign > 0 {
-                s.notify(format!("{foreign} saved label move(s) in style {name} not applied: they name another layer's features"), false);
+                s.notify(format!("{foreign} saved label move(s) in style {name} not applied: they name the features of the layer the style was made from"), false);
             }
             if lost > 0 {
                 s.notify(format!("{lost} saved label move(s) dropped with label classes style {name} doesn't have"), false);
