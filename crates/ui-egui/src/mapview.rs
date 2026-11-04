@@ -1506,7 +1506,7 @@ struct MovingLabel {
 /// what the Move Label tool grabs, as it is drawn now. Labels not of a layer's features aren't;
 /// nor any while a moving globe or tilted map draws them from where they were placed.
 fn label_at(app: &RustGisApp, rect: Rect, p: Pos2) -> Option<PlacedLabel> {
-    if app.map.key.is_none_or(|key| key.rev != app.session.revision) {
+    if app.map.key.is_none_or(|key| key.rev != app.session.revision || key.sources != rustgis_engine::map::source::generation()) {
         return None;
     }
     let cam = app.session.map().camera;
@@ -1514,7 +1514,7 @@ fn label_at(app: &RustGisApp, rect: Rect, p: Pos2) -> Option<PlacedLabel> {
     // A flat map moving draws the labels placed last with its frame: shifted, and spread apart
     // or closed up as it zooms (as `main_view` does).
     let (shift, s) = if placed == cam {
-        (vec2(0.0, 0.0), 1.0)
+        (app.map.tex_rect.min - rect.min, 1.0)
     } else if app.session.map().projection != Projection::Globe && placed.pitch == 0.0 && cam.pitch == 0.0 && placed.bearing == cam.bearing
     {
         (app.map.tex_rect.min - rect.min, (app.map.tex_camera.res / cam.res) as f32)
@@ -4516,6 +4516,17 @@ mod tests {
             let l = h.state().map.labels.iter().find(|l| l.text == "Place 3").unwrap();
             rect.min + vec2(l.x, l.y)
         };
+        // Hit testing follows a retained frame's origin and refuses its old source window.
+        let at = grab(&h);
+        let retained = h.state().map.tex_rect;
+        let shift = vec2(80.0, 80.0);
+        h.state_mut().map.tex_rect = retained.translate(shift);
+        assert_eq!(label_at(h.state(), rect, at + shift).unwrap().text, "Place 3");
+        h.state_mut().map.tex_rect = retained;
+        let key = h.state().map.key;
+        h.state_mut().map.key.as_mut().unwrap().sources = rustgis_engine::map::source::generation().wrapping_add(1);
+        assert!(label_at(h.state(), rect, at).is_none());
+        h.state_mut().map.key = key;
         let moved = |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer(id).unwrap().labels.default.moved.clone();
         let none = egui::Modifiers::NONE;
         let drag = |h: &mut egui_kittest::Harness<'_, RustGisApp>, escape: bool| {

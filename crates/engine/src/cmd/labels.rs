@@ -446,9 +446,11 @@ pub(crate) fn same_class_list(a: &Labeling, b: &Labeling) -> bool {
 }
 
 /// Whether a lock taken with the labels `a` still names those of `b`: the same classes, listed
-/// alike and putting their point labels in the same places.
+/// alike, putting their point labels in the same places, with unchanged overlap and callouts.
 pub(crate) fn lock_holds(a: &Labeling, b: &Labeling) -> bool {
-    same_class_list(a, b) && same_places(a, b)
+    same_class_list(a, b)
+        && same_places(a, b)
+        && a.in_order().zip(b.in_order()).all(|(x, y)| x.show_all == y.show_all && x.callout == y.callout)
 }
 
 /// Whether the classes of `a` and `b` (listed alike) put their point labels in the same places.
@@ -501,6 +503,7 @@ fn clause(p: &Value, ds: &Dataset) -> Result<Option<Option<String>>, String> {
     }
 }
 
+/// Adds a class from existing styling and a checked clause, without inheriting feature-specific moves.
 fn add_class(s: &mut Session, p: &Value) -> CmdResult {
     let name = s_req(p, "name")?.to_string();
     let from = class_param(p, "from")?.map(String::from);
@@ -516,7 +519,7 @@ fn add_class(s: &mut Session, p: &Value) -> CmdResult {
             None => &labels.default,
             Some(n) => labels.class(n).ok_or_else(|| format!("no label class named '{n}'"))?,
         };
-        let class = LabelClass { name: name.clone(), visible: true, where_: clause, ..base.clone() };
+        let class = LabelClass { name: name.clone(), visible: true, where_: clause, moved: Vec::new(), ..base.clone() };
         labels.classes.push(class);
         added = name;
         Ok(())

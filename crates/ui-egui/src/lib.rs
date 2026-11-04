@@ -3789,7 +3789,9 @@ impl RustGisApp {
                 }
                 // A snapshot can capture the screen while the map is on it.
                 relay.set_screen(relayshot::map_shown(self, ctx));
-                relay.poll(&mut self.session);
+                if relay.poll(&mut self.session) > 0 {
+                    self.map.cancel_label_drag();
+                }
             }
             relayshot::drive(self, ctx);
             // A script an agent wrote to the file bridge.

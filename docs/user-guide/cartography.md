@@ -471,6 +471,10 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   anything else pans the map; Esc leaves the tool
   (`labels.move={"layer": "Cities", "feature": 12, "to": [2.5, 49.1]}`; `"to": null` puts it back;
   `labels.resetMoved={"layer": "Cities", "all": true}`).
+  Deleting a feature removes its saved move; Undo restores it. Service refresh and Repair Data Source reset saved
+  moves and old label locks because replacement data can reuse feature ids, with a counted notice
+  and undo restoration. Opening a project reports invalid, duplicate or excess moved-label entries
+  that were ignored, and callout lengths that were adjusted. Clean settings give no such notice.
 - **Font**: the labels' font family, any installed on the computer (Labeling pane › Symbol
   › **Font**; type part of a name to find it), or the label font the interface uses. Bold and
   italic take the family's own bold and italic faces where it has them. The family is saved by
@@ -505,9 +509,6 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   take the place a less important one had. The class's offset applies to every place, and Lock
   keeps the place each label took
   (`labels.placement={"layer": "Cities", "otherPositions": true}`).
-Repair Data Source resets saved label moves, because replacement data can reuse feature ids.
-A notice gives the count; Undo restores the old source and moves.
-
 - **Lock** keeps the labelled features fixed while you pan and zoom; **Pause** stops drawing
   labels for faster navigation; **View Unplaced** draws the labels that didn't fit in red. They
   apply to the whole map, so they are on the ribbon (Labeling › Map Labeling), not in the pane.

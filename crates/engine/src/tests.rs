@@ -3597,6 +3597,85 @@ fn a_new_feature_doesnt_take_the_locked_label_of_a_deleted_one() {
     assert_eq!(draw(&mut s), ["Alpha 2"]);
 }
 
+/// Deleting a feature removes its saved label move before its id can be reused; undo restores it.
+#[test]
+fn a_new_feature_doesnt_take_the_moved_label_of_a_deleted_one() {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let mut s = Session::new(Project::default());
+    let mut data = Dataset::new("Sites", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+    data.push(Some(Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![V::Text("Old".into())]);
+    let layer = s.map_mut().add_dataset(data);
+    s.run("labels.enable", &json!({"layer":layer,"on":true})).unwrap();
+    s.run("labels.move", &json!({"layer":layer,"feature":1,"to":[1.0,1.0]})).unwrap();
+    s.map_mut().layer_mut(layer).unwrap().selection = vec![0];
+    s.run("edit.delete", &Value::Null).unwrap();
+    assert!(s.map().layer(layer).unwrap().labels.default.moved.is_empty());
+    s.run("edit.addFeature", &json!({"layer":layer,"geometry":{"type":"Point","coordinates":[0.0,0.0]},"attributes":{"name":"New"}}))
+        .unwrap();
+    assert_eq!(s.map().layer(layer).unwrap().dataset.features[0].id, 1);
+    let view = crate::render::View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera: s.map().camera, sky: false };
+    let labels = crate::render::render(s.map_mut(), &view).unwrap().labels;
+    assert!(labels.iter().any(|l| l.text == "New" && !l.collide.pinned));
+    s.run("edit.undo", &Value::Null).unwrap();
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.map().layer(layer).unwrap().labels.default.moved_to(1), Some([1.0, 1.0]));
+    s.run("edit.redo", &Value::Null).unwrap();
+    assert!(s.map().layer(layer).unwrap().labels.default.moved.is_empty());
+}
+
+/// Project opening reports discarded label settings once per kind; clean settings stay quiet.
+#[test]
+fn opening_projects_reports_moved_label_and_callout_adjustments() {
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType};
+    let mut project = Project::default();
+    project.maps[0].add_dataset(Dataset::new("Sites", GeometryType::Point, vec![Field::new("name", FieldType::Text)]));
+    project.maps[0].layers[0].labels.default.move_label(1, Some([2.0, 3.0]));
+    project.styles.push(crate::project::StyleItem {
+        name: "Saved labels".into(),
+        geometry: GeometryType::Point,
+        renderer: project.maps[0].layers[0].renderer.clone(),
+        labels: project.maps[0].layers[0].labels.clone(),
+        transparency: 0.0,
+    });
+    project.offline_areas.push(crate::project::OfflineArea {
+        name: "Field copy".into(),
+        map: "Map".into(),
+        extent: rustgis_geom::Extent::new(-1.0, -1.0, 1.0, 1.0),
+        created: 0.0,
+        synced: 0.0,
+        data: project.maps[0].clone(),
+    });
+    let clean = serde_json::to_string(&project).unwrap();
+    let clean_session = Session::new(Project::from_json(&clean).unwrap());
+    assert!(clean_session.notices.is_empty());
+    let mut damaged: Value = serde_json::from_str(&clean).unwrap();
+    let labels = &mut damaged["maps"][0]["layers"][0]["labels"];
+    labels["moved"] = json!([
+        {"id":1,"at":[2.0,3.0]}, {"id":1,"at":[4.0,5.0]},
+        {"id":-1,"at":[2.0,3.0]}, {"id":1.5,"at":[2.0,3.0]}, {"id":2,"at":[2.0,100.0]}
+    ]);
+    labels["callout"] = json!(900);
+    damaged["styles"][0]["labels"]["moved"] = json!("damaged");
+    damaged["styles"][0]["labels"]["callout"] = json!(-1);
+    let text = damaged.to_string();
+    let loaded = Project::from_json(&text).unwrap();
+    assert_eq!(loaded.maps[0].layers[0].labels.default.moved_to(1), Some([4.0, 5.0]));
+    let startup = Session::new(loaded);
+    assert_eq!(startup.notices.len(), 2);
+    assert!(startup.notices.iter().any(|n| n.text.contains("5 invalid, duplicate or excess moved-label")));
+    assert!(startup.notices.iter().any(|n| n.text.contains("2 callout length setting(s) adjusted")));
+    let mut opened = Session::new(Project::default());
+    opened.run("project.openText", &json!({"text":text})).unwrap();
+    assert_eq!(opened.notices.iter().filter(|n| n.text.contains("while opening the project")).count(), 2);
+    assert!(!serde_json::to_string(&opened.project).unwrap().contains("label_read_notices"));
+    let mut excess: Value = serde_json::from_str(&clean).unwrap();
+    excess["styles"][0]["labels"]["moved"] =
+        Value::Array((0..=rustgis_map::symbology::MAX_MOVED_LABELS).map(|id| json!({"id":id,"at":[0.0,0.0]})).collect());
+    let capped = Session::new(Project::from_json(&excess.to_string()).unwrap());
+    assert_eq!(capped.notices.len(), 1);
+    assert!(capped.notices[0].text.contains("1 invalid, duplicate or excess moved-label"));
+}
+
 /// A streamed layer holds only the window in view: a lock's entry for a feature outside it stays
 /// when the window changes (#1135).
 #[test]
@@ -3609,7 +3688,7 @@ fn a_lock_holds_for_a_streamed_layers_features_outside_its_window() {
     let before = s.project.clone();
     // The window moves off the feature: no longer shared with the copy, and without its id.
     s.map_mut().layer_mut(id).unwrap().dataset.features = Vec::new().into();
-    crate::forget_locks_of_removed_features(&before, &mut s.project);
+    crate::forget_label_state_of_removed_features(&before, &mut s.project);
     assert_eq!(s.map().label_lock.as_ref().map(Vec::len), Some(1));
     drop(s);
     remove_shp(&p);
@@ -3645,6 +3724,56 @@ fn a_change_to_the_label_classes_locks_the_labels_again() {
         draw(&mut s);
         assert!(s.map().label_lock.is_some(), "{id}: locked on the next frame");
     }
+}
+
+/// Changes that affect collision placement discard the lock; a new class inherits styling,
+/// but not feature-specific manual positions.
+#[test]
+fn label_collision_changes_refresh_locks_without_copying_moves() {
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let feature = s.map().layer(id).unwrap().dataset.features[0].id;
+    for params in [json!({"showAll":true}), json!({"callout":true}), json!({"callout":false})] {
+        s.map_mut().label_lock = Some(vec![((id, feature, 0, 0), Default::default())]);
+        let mut p = params;
+        p["layer"] = json!(id);
+        s.run("labels.placement", &p).unwrap();
+        assert!(s.map().label_lock.is_none(), "{p} changes collision placement");
+    }
+    s.run("labels.move", &json!({"layer":id,"feature":feature,"to":[1,1]})).unwrap();
+    s.run("labels.class.add", &json!({"layer":id,"name":"New"})).unwrap();
+    let labels = &s.map().layer(id).unwrap().labels;
+    assert_eq!(labels.default.moved.len(), 1);
+    assert!(labels.class("New").unwrap().moved.is_empty());
+}
+
+/// A service refresh assigns new ids: default and named-class moves must not attach to them,
+/// and the discarded moves are counted. Undo restores the old features and positions.
+#[test]
+fn service_refresh_resets_saved_label_moves_with_a_notice() {
+    let server = ogc_server::Server::group_fixture();
+    let mut s = Session::new(Project::default());
+    s.run("service.import", &json!({"url":server.root()})).unwrap();
+    let id = s.map().layer_by_name("Places").unwrap().id;
+    let feature = s.map().layer(id).unwrap().dataset.features[0].id;
+    s.run("labels.class.add", &json!({"layer":id,"name":"Named"})).unwrap();
+    for class in [None, Some("Named")] {
+        let mut p = json!({"layer":id,"feature":feature,"to":[1,1]});
+        if let Some(class) = class {
+            p["class"] = json!(class);
+        }
+        s.run("labels.move", &p).unwrap();
+    }
+    let mark = s.notice_mark();
+    s.run("service.refresh", &json!({"layer":id})).unwrap();
+    assert!(s.map().layer(id).unwrap().labels.in_order().all(|c| c.moved.is_empty()));
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("2 saved label move(s) reset")));
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().labels.in_order().map(|c| c.moved.len()).sum::<usize>(), 2);
+    s.run("edit.redo", &Value::Null).unwrap();
+    let mark = s.notice_mark();
+    s.run("service.refresh", &json!({"layer":id})).unwrap();
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("saved label move(s) reset")));
 }
 
 /// Label classes by command (#618): added from Default and checked before it, renamed, given

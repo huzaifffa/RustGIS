@@ -982,7 +982,15 @@ fn crowding(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
             let Some(reach) = c.it.callout else { return };
             let mut v = f64::from(reach);
             let r = ui
-                .add(egui::DragValue::new(&mut v).range(CALLOUT_REACH).speed(1.0).max_decimals(0).prefix(tl!("at most ")).suffix(" pt"))
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .update_while_editing(false)
+                        .range(CALLOUT_REACH)
+                        .speed(1.0)
+                        .max_decimals(0)
+                        .prefix(tl!("at most "))
+                        .suffix(" pt"),
+                )
                 .labelled_by(input_label.id)
                 .on_hover_text(tl!("The longest a callout's line may be."));
             crate::ribbon::live_drag(

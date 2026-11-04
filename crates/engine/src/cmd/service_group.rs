@@ -268,6 +268,7 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
     // whose classes no longer read, drawn with a single symbol.
     let mut notes = Vec::new();
     let mut singled = Vec::new();
+    let mut moved = 0;
     for ((mut child, mut dataset), existing) in reads.into_iter().zip(matches) {
         let existing = existing.and_then(|id| s.map_mut().layer_mut(id));
         if let Some(layer) = existing {
@@ -278,6 +279,9 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
             dataset.name = layer.name.clone();
             layer.dataset = dataset;
             layer.selection.clear();
+            moved += layer.labels.in_order().map(|class| class.moved.len()).sum::<usize>();
+            layer.labels.default.moved.clear();
+            layer.labels.classes.iter_mut().for_each(|class| class.moved.clear());
             let invalid_renderer = match &layer.renderer {
                 rustgis_map::Renderer::Single(_) => false,
                 rustgis_map::Renderer::Unique { expression: Some(e), .. } => rustgis_data::query::parse(e, &layer.dataset).is_err(),
@@ -342,6 +346,9 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
         children.push(child);
+    }
+    if moved > 0 {
+        s.notify(format!("{moved} saved label move(s) reset in refreshed service layers"), false);
     }
     if !notes.is_empty() {
         let lost: usize = notes.iter().map(|(_, n)| n).sum();
