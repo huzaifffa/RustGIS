@@ -183,7 +183,12 @@ file sources cannot be resolved and are listed in the import notes.
 Each layer keeps its look:
 
 - **Renderers**: single symbol, categorized (as Unique Values, a category's merged values each a
-  class, its "all other values" category the rest), graduated (as Graduated Colors), and
+  class, its "all other values" category the rest; by a field, or by an expression as Unique
+  Values by that [expression](cartography.md), its boolean categories matching true and false;
+  one that can't be read on the layer draws every feature with the first category's symbol
+  that's switched on, or nothing when no category is, noted),
+  graduated (as Graduated Colors, by a field: ranges by an expression are noted and drawn with
+  the first range's symbol), and
   rule-based: as Unique Values on a field where every rule picks values of that field at every
   scale (an else rule the rest), else as Unique Values by an
   [expression](cartography.md) that gives each feature the first rule it meets, each rule a class
@@ -455,7 +460,7 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
 - **Plugins**: **Plugins › Plugin Manager** installs, updates and removes [plugins](../plugins.md)
   from the registry at [plugins.rustgis.app](https://plugins.rustgis.app) or from a file.
 - **Language**: **Settings › Language** switches the interface among
-  [19 languages](../i18n.md) and chooses the [worldview](maps.md#worldview) of the built-in
+  [20 languages](../i18n.md) and chooses the [worldview](maps.md#worldview) of the built-in
   borders.
 - **Autosave**: **Settings › Autosave** sets how often the desktop app keeps a
   [recovery copy](#autosave-and-recovery) of unsaved work, or turns it off.

@@ -37,6 +37,9 @@ use serde_json::Value;
 
 pub type CmdResult = Result<Value, String>;
 
+/// A download that landed read already: its layer, and what reading it skipped or noticed.
+pub(crate) type LandedRead = Box<(rustgis_data::Dataset, rustgis_data::ReadReport)>;
+
 /// A command.
 #[derive(Clone, Copy)]
 pub struct CommandSpec {
@@ -498,6 +501,7 @@ struct PutAside {
     plugin_runs: Vec<cmd::gp::StartedRun>,
     downloading: Vec<u64>,
     downloaded: Vec<(u64, Vec<u8>)>,
+    landed_reads: Vec<(u64, LandedRead)>,
     url_requests: Vec<serde_json::Value>,
     plugin_retries: Vec<cmd::plugins::fetch::Retry>,
     /// A style of the project still loading, which mustn't move the next one's view.
@@ -505,6 +509,8 @@ struct PutAside {
     #[cfg(not(target_arch = "wasm32"))]
     sql_results: Vec<(u64, String, Option<String>, rustgis_data::source::duckdb::Output)>,
     trend_results: Vec<(u64, Vec<rustgis_data::raster::Raster>, usize)>,
+    raster_results: Vec<(u64, cmd::workflows::Made)>,
+    raster_runs: Vec<u64>,
     edit_counts: std::collections::HashMap<u32, cmd::design::EditCounts>,
 }
 
@@ -545,6 +551,9 @@ pub struct Session {
     /// How rasters added from now on are drawn (`raster.setDefaultStyle`; kept with the app's
     /// preferences, not the project).
     pub raster_defaults: rustgis_map::RasterDefaults,
+    /// The favourite arrangement of publication layouts (`layout.arrangement`, #1379): a name or a
+    /// corner for each surround, kept with the app's preferences, not the project.
+    pub layout_favourite: serde_json::Value,
     pub registry: Registry,
     /// Bumped on every change so views can cache.
     pub revision: u64,
@@ -675,6 +684,9 @@ pub struct Session {
     downloading: Vec<u64>,
     /// Downloads that landed, waiting for `layer.addDownload`.
     pub(crate) downloaded: Vec<(u64, Vec<u8>)>,
+    /// Downloads that landed already read (an ArcGIS layer's protocol buffer pages, joined),
+    /// waiting for `layer.addDownload` too.
+    pub(crate) landed_reads: Vec<(u64, LandedRead)>,
     /// Downloads a command asked for where nothing may wait (the browser): the parameters of
     /// `layer.addUrl` calls, for the front end to fetch and add (see [`Session::take_url_requests`]).
     pub(crate) url_requests: Vec<serde_json::Value>,
@@ -698,12 +710,23 @@ pub struct Session {
     /// Trends the app worked out on a thread, waiting for `cube.trend {"ran"}`: the id, the
     /// layers and how many dates (see [`cmd::cube::land`]).
     pub(crate) trend_results: Vec<(u64, Vec<rustgis_data::raster::Raster>, usize)>,
+    /// Rasters the app made on a thread for an Analysis workflow, waiting for its command with
+    /// `{"ran"}` (see [`cmd::workflows::raster_land`]).
+    pub(crate) raster_results: Vec<(u64, cmd::workflows::Made)>,
+    /// The ids of the Analysis workflows running on a thread (see
+    /// [`cmd::workflows::raster_start`]), apart from the downloads'.
+    pub(crate) raster_runs: Vec<u64>,
     /// Set where nothing waits on a command but a shell (`rustgis-cli run`): long runs a command
     /// works out where it's called (a trend over a state from a data cube) take the app's larger
     /// bounds, as its panes do on a thread, and tell their progress (a share, 0 to 1, and 1 when
     /// one succeeds) through this. Python leaves it unset: a run there holds the interpreter's
     /// lock and can't be interrupted, so it keeps the Script pane's bounds.
     pub long_runs: Option<fn(&str, f64)>,
+    /// Set where a person at a terminal waits on a command (`rustgis-cli run` with stdin and
+    /// stderr a terminal), who can stop it with Ctrl-C: tools and rasters take no work cap
+    /// ([`rustgis_analysis::control::Control::stoppable`]). A program that calls it (an agent, a
+    /// CI job) may wait with a timeout, so there they keep their caps.
+    pub stoppable: bool,
 }
 
 /// The most `layer.addUrl` requests kept for the front end at a time.
@@ -875,6 +898,7 @@ impl Session {
             s3_pending: Vec::new(),
             database_logins: connections::DatabaseLogins::default(),
             raster_defaults: rustgis_map::RasterDefaults::default(),
+            layout_favourite: serde_json::Value::String("classic".into()),
             registry: Registry { commands: cmd::all() },
             revision: 1,
             opened: 0,
@@ -931,6 +955,7 @@ impl Session {
             plugin_panels: std::collections::BTreeMap::new(),
             downloading: Vec::new(),
             downloaded: Vec::new(),
+            landed_reads: Vec::new(),
             url_requests: Vec::new(),
             file_outputs: Vec::new(),
             #[cfg(test)]
@@ -943,7 +968,10 @@ impl Session {
             #[cfg(not(target_arch = "wasm32"))]
             sql_results: Vec::new(),
             trend_results: Vec::new(),
+            raster_results: Vec::new(),
+            raster_runs: Vec::new(),
             long_runs: None,
+            stoppable: false,
         };
         for text in label_notices {
             session.notify(text, false);
@@ -981,9 +1009,29 @@ impl Session {
     /// Hands over a download's bytes, for `layer.addDownload {"id"}`; `false` when it was dropped
     /// (another project was opened meanwhile).
     pub fn download_landed(&mut self, id: u64, bytes: Vec<u8>) -> bool {
+        let landed = self.landed(id);
+        if landed {
+            self.downloaded.push((id, bytes));
+        }
+        landed
+    }
+
+    /// Hands over a download read already (an ArcGIS layer's protocol buffer pages, joined, see
+    /// [`ogc::Step::Decoded`](rustgis_data::ogc::Step::Decoded)), for `layer.addDownload {"id"}`
+    /// as [`Session::download_landed`] does.
+    pub fn download_landed_read(&mut self, id: u64, dataset: rustgis_data::Dataset, report: rustgis_data::ReadReport) -> bool {
+        let landed = self.landed(id);
+        if landed {
+            self.landed_reads.push((id, Box::new((dataset, report))));
+        }
+        landed
+    }
+
+    /// Takes a download off those under way: `false` when it isn't one of them (another project
+    /// was opened meanwhile).
+    fn landed(&mut self, id: u64) -> bool {
         let Some(i) = self.downloading.iter().position(|d| *d == id) else { return false };
         self.downloading.remove(i);
-        self.downloaded.push((id, bytes));
         true
     }
 
@@ -1439,12 +1487,15 @@ impl Session {
             plugin_runs: take(&mut self.plugin_runs),
             downloading: take(&mut self.downloading),
             downloaded: take(&mut self.downloaded),
+            landed_reads: take(&mut self.landed_reads),
             url_requests: take(&mut self.url_requests),
             plugin_retries: take(&mut self.plugin_retries),
             style_view: self.style_view.take(),
             #[cfg(not(target_arch = "wasm32"))]
             sql_results: take(&mut self.sql_results),
             trend_results: take(&mut self.trend_results),
+            raster_results: take(&mut self.raster_results),
+            raster_runs: take(&mut self.raster_runs),
             edit_counts: take(&mut self.edit_counts),
         }
     }
@@ -1487,12 +1538,15 @@ impl Session {
             plugin_runs,
             downloading,
             downloaded,
+            landed_reads,
             url_requests,
             plugin_retries,
             style_view,
             #[cfg(not(target_arch = "wasm32"))]
             sql_results,
             trend_results,
+            raster_results,
+            raster_runs,
             edit_counts,
         } = *a;
         (self.undo, self.redo, self.back, self.forward, self.last_camera) = (undo, redo, back, forward, last_camera);
@@ -1509,7 +1563,8 @@ impl Session {
         (self.pending, self.plugin_runs, self.plugin_retries) = (pending, plugin_runs, plugin_retries);
         self.file_outputs = file_outputs;
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
-        self.trend_results = trend_results;
+        self.landed_reads = landed_reads;
+        (self.trend_results, self.raster_results, self.raster_runs) = (trend_results, raster_results, raster_runs);
         #[cfg(feature = "geolibre")]
         {
             self.started = started;

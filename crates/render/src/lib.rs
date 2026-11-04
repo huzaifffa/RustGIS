@@ -258,6 +258,9 @@ pub struct PlacedIcon {
     pub h: f32,
     /// Turned with the map (an arrow along a street), in radians clockwise; `None` is upright.
     pub angle: Option<f32>,
+    /// How much of it shows, 0 to 1: a tile layer's opacity fades its icons as it fades its
+    /// fills and lines (#1358). 1 draws it as it is.
+    pub alpha: f32,
 }
 
 pub struct Rendered {
@@ -3180,7 +3183,7 @@ fn render_frame(
     }
     // Set when tiny-skia actually rasterizes into the accumulator.
     let mut cpu_dirty = false;
-    if land != water {
+    if map.draws_world_outline() {
         let fill = paint(land, 1.0);
         let stroke = (outline.a() > 0).then(|| (paint(outline, 1.0), 0.6));
         let custom_world = custom.then(|| world_in(&flat, &key));
@@ -4436,7 +4439,8 @@ fn draw_icon(pm: &mut Canvas, icon: &PlacedIcon, ppp: f32) {
     // Scaled about its centre, turned there, then put in place.
     let turn = icon.angle.filter(|a| a.is_finite()).map_or(0.0, f32::to_degrees);
     let t = Transform::from_translate(-iw / 2.0, -ih / 2.0).post_scale(sx, sy).post_rotate(turn).post_translate(cx, cy);
-    let paint = PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..PixmapPaint::default() };
+    let opacity = if icon.alpha.is_finite() { icon.alpha.clamp(0.0, 1.0) } else { 1.0 };
+    let paint = PixmapPaint { opacity, quality: tiny_skia::FilterQuality::Bilinear, ..PixmapPaint::default() };
     pm.draw_pixmap(0, 0, Pixmap::as_ref(&icon.image), &paint, t, None);
 }
 
@@ -5822,7 +5826,7 @@ mod tests {
         let icon = |x: f32| {
             let mut p = Pixmap::new(4, 4).unwrap();
             p.fill(tiny_skia::Color::from_rgba8(0, 0, 255, 255));
-            PlacedIcon { image: std::sync::Arc::new(p), x, y: 20.0, w: 10.0, h: 10.0, angle: None }
+            PlacedIcon { image: std::sync::Arc::new(p), x, y: 20.0, w: 10.0, h: 10.0, angle: None, alpha: 1.0 }
         };
         // Two icons on the same spot collide even with no text; one far away doesn't.
         let cands = vec![
@@ -5843,10 +5847,28 @@ mod tests {
         assert_eq!(pm.pixel(60, 20).unwrap().alpha(), 0);
     }
 
+    /// An icon's `alpha` fades it (a tile layer's opacity, #1358); out-of-range or non-finite values
+    /// never panic or draw outside 0 to 1.
+    #[test]
+    fn an_icon_is_drawn_at_its_alpha() {
+        let alpha = |a: f32| {
+            let mut pm = Pixmap::new(20, 20).unwrap();
+            let icon = PlacedIcon { alpha: a, ..icon_at(10.0, 10.0, 10.0, 10.0, None) };
+            crate::canvas::with_canvas(&mut pm, |c| draw_icon(c, &icon, 1.0));
+            pm.pixel(10, 10).unwrap().alpha()
+        };
+        assert_eq!(alpha(1.0), 255);
+        assert!((i32::from(alpha(0.5)) - 128).abs() <= 2, "{}", alpha(0.5));
+        assert_eq!(alpha(0.0), 0);
+        assert_eq!(alpha(7.0), 255);
+        assert_eq!(alpha(-1.0), 0);
+        assert_eq!(alpha(f32::NAN), 255);
+    }
+
     fn icon_at(x: f32, y: f32, w: f32, h: f32, angle: Option<f32>) -> PlacedIcon {
         let mut p = Pixmap::new(4, 4).unwrap();
         p.fill(tiny_skia::Color::from_rgba8(0, 0, 255, 255));
-        PlacedIcon { image: std::sync::Arc::new(p), x, y, w, h, angle }
+        PlacedIcon { image: std::sync::Arc::new(p), x, y, w, h, angle, alpha: 1.0 }
     }
 
     fn texts(p: &Placement) -> Vec<&str> {

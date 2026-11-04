@@ -4,7 +4,7 @@
 use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
 use rustgis_geom::Coord;
 use rustgis_map::symbology::{MAX_LABEL_CLASSES, label_class_name};
-use rustgis_map::{LabelBackground, LabelClass, LabelMatcher, LabelPlacement, Labeling, Renderer, Rgba, Symbol};
+use rustgis_map::{LabelBackground, LabelClass, LabelMatcher, LabelPlacement, Labeling, Layer, Renderer, Rgba, Symbol};
 use serde_json::{Value, json};
 
 use super::layer::s_req;
@@ -176,18 +176,17 @@ pub fn commands() -> Vec<C> {
                     _ => return Err("callout must be true or false, or its longest line in points".into()),
                 },
             };
-            // A point's label tries the other places round it when its own is taken (#1011).
+            // A label tries other places when its own is taken: round its point (#1011), or along
+            // its line (#1187).
             let others = match p.get("otherPositions") {
                 None => None,
                 Some(Value::Bool(on)) => Some(*on),
                 Some(_) => return Err("otherPositions must be true or false".into()),
             };
-            // Only a point's label goes round it: on elsewhere it would do nothing (off is taken
-            // anywhere). `layer_id` refuses a missing layer.
-            if others == Some(true) && s.map().layer(s.layer_id(p)?).is_some_and(|l| l.geometry_type() != GeometryType::Point) {
-                return Err("otherPositions is for point layers".into());
-            }
-            with_class(s, p, |c| {
+            let id = s.layer_id(p)?;
+            let (points, lines) = points_and_lines(s.map().layer(id).ok_or("no such layer")?);
+            with_labels(s, p, |labels| {
+                let c = class_in(labels, p)?;
                 if let Some(pos) = pos {
                     c.placement = pos;
                 }
@@ -209,11 +208,17 @@ pub fn commands() -> Vec<C> {
                     Some(Callout::Reach(r)) => c.callout = Some(r),
                     None => {}
                 }
+                // Asked of the class as this call leaves it, so a position or a repeat given with
+                // it counts. On where it would do nothing is refused; off is taken anywhere.
+                if others == Some(true) && !tries_other_places(points, lines, c) {
+                    return Err("otherPositions is for points, and for lines placed parallel or curved without a repeat".into());
+                }
+                Ok(())
             })
         })
         .when(need_feature_layer)
         .params(
-            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset, repeat, otherPositions, showAll or callout), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only), "otherPositions"?: bool (a point label tries other positions around the point; point layers only), "showAll"?: bool (every label drawn, over the others where they crowd), "callout"?: true|false|points (5 to 500: a label crowded off its spot moves to a free one nearby, a line drawn back to its feature at most this long; true keeps its length, or 40; false, 0 or null: none; not labels along a line)}"#,
+            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset, repeat, otherPositions, showAll or callout), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only), "otherPositions"?: bool (a label whose place is taken tries others: a point's round the point, corners first; a line's along the line, nearest its middle first, placed parallel or curved without a repeat; true is refused for any other line label and on polygons), "showAll"?: bool (every label drawn, over the others where they crowd), "callout"?: true|false|points (5 to 500: a label crowded off its spot moves to a free one nearby, a line drawn back to its feature at most this long; true keeps its length, or 40; false, 0 or null: none; not labels along a line)}"#,
         ),
         // Labels moved by hand (the Move Label tool, as QGIS's): kept by their feature's id.
         C::new("labels.move", "Move Label", "Labeling › Label Placement", |s, p| {
@@ -351,6 +356,19 @@ pub fn commands() -> Vec<C> {
     ]
 }
 
+/// Whether the layer holds points and lines: declared so, or among its features, as the renderer
+/// goes by each feature's geometry.
+fn points_and_lines(l: &Layer) -> (bool, bool) {
+    (l.has_geometry(GeometryType::Point), l.has_geometry(GeometryType::Polyline))
+}
+
+/// Whether a class on a layer holding these has other places to try when its label's own is taken:
+/// round a point at any position (#1011), or along a line for a label at its middle (#1187). Each
+/// repeat is already a place of its own, so repeats get none.
+fn tries_other_places(points: bool, lines: bool, c: &LabelClass) -> bool {
+    points || (lines && c.placement.along_line() && c.repeat.is_none())
+}
+
 /// `labels.by`: sets a label class's expressions, each checked against the layer's fields.
 fn labels_by(s: &mut Session, p: &Value) -> CmdResult {
     const KEYS: [&str; 4] = ["text", "size", "color", "angle"];
@@ -429,7 +447,7 @@ pub(crate) fn with_labels(s: &mut Session, p: &Value, f: impl FnOnce(&mut Labeli
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     let mut labels = l.labels.clone();
     f(&mut labels)?;
-    let relock = !lock_holds(&l.labels, &labels);
+    let relock = !lock_holds(l, &labels);
     l.labels = labels;
     if relock {
         s.map_mut().label_lock = None;
@@ -445,23 +463,27 @@ pub(crate) fn same_class_list(a: &Labeling, b: &Labeling) -> bool {
     a.classes.iter().map(|c| &c.name).eq(b.classes.iter().map(|c| &c.name))
 }
 
-/// Whether a lock taken with the labels `a` still names those of `b`: the same classes, listed
+/// Whether a lock taken with the layer's labels still names those of `b`: the same classes, listed
 /// alike, putting their point labels in the same places, with unchanged overlap and callouts.
-pub(crate) fn lock_holds(a: &Labeling, b: &Labeling) -> bool {
-    same_class_list(a, b)
-        && same_places(a, b)
-        && a.in_order().zip(b.in_order()).all(|(x, y)| x.show_all == y.show_all && x.callout == y.callout)
+pub(crate) fn lock_holds(l: &Layer, b: &Labeling) -> bool {
+    same_class_list(&l.labels, b)
+        && same_places(l, b)
+        && l.labels.in_order().zip(b.in_order()).all(|(x, y)| x.show_all == y.show_all && x.callout == y.callout)
 }
 
-/// Whether the classes of `a` and `b` (listed alike) put their point labels in the same places.
-/// A lock names the place round its point a label took by its number among its class's (#1011),
-/// so another position, or trying the others turned on or off, locks the labels again; with no
-/// class trying them a new position keeps the lock, as before.
-fn same_places(a: &Labeling, b: &Labeling) -> bool {
-    let classes = |l: &Labeling| {
-        l.classes.iter().chain([&l.default]).map(|c| (c.placement, c.other_positions, c.repeat.is_some())).collect::<Vec<_>>()
+/// Whether the layer's classes and those of `b` (listed alike) put their labels in the same places.
+/// A lock names the place round its point or along its line a label took by its number among its
+/// class's (#1011, #1187), so another position, or trying the others turned on or off, locks the
+/// labels again; with no class trying them a new position keeps the lock, as before. The flag only
+/// counts where it has an effect: kept on a line's class at a position off the line, or with a
+/// repeat, it does nothing ([`tries_other_places`]).
+fn same_places(l: &Layer, b: &Labeling) -> bool {
+    let (points, lines) = points_and_lines(l);
+    let classes = |labels: &Labeling| {
+        let tries = |c: &LabelClass| c.other_positions && tries_other_places(points, lines, c);
+        labels.classes.iter().chain([&labels.default]).map(|c| (c.placement, tries(c), c.repeat.is_some())).collect::<Vec<_>>()
     };
-    classes(a).into_iter().zip(classes(b)).all(|(x, y)| x == y || !(x.1 || y.1))
+    classes(&l.labels).into_iter().zip(classes(b)).all(|(x, y)| x == y || !(x.1 || y.1))
 }
 
 /// The place of the class named `name` among those checked before Default (of the
