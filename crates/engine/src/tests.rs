@@ -4044,9 +4044,11 @@ fn a_project_template_leaves_out_label_moves() {
     let id = s.map().layer_by_name("Cities").unwrap().id;
     let feature = s.map().layer(id).unwrap().dataset.features[0].id;
     s.run("labels.move", &json!({"layer": id, "feature": feature, "to": [1, 1]})).unwrap();
+    // A style saved from the layer holds the move too.
+    s.run("style.new", &json!({"layer": id, "name": "Moved"})).unwrap();
     let mark = s.notice_mark();
     s.run("project.saveTemplate", &json!({"path": path})).unwrap();
-    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("1 saved label move(s) left out of the template")));
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("2 saved label move(s) left out of the template")));
     let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert!(!saved.to_string().contains("\"moved\""));
     std::fs::remove_dir_all(&dir).ok();

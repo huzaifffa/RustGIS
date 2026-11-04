@@ -1566,7 +1566,8 @@ fn label_class_name(app: &RustGisApp, layer: u32, class: u32) -> Option<String> 
     app.session.map().layer(layer)?.labels.in_order().nth(class as usize).map(|c| c.name.clone())
 }
 
-/// Paints a moved-label preview, keeping callouts below text and curved glyph halos below ink.
+/// Paints a label (on the map, or a moved one's preview), keeping callouts below text and curved
+/// glyph halos below ink.
 fn draw_label(p: &egui::Painter, l: &PlacedLabel, at: Pos2) {
     // A callout's line, from its feature to the edge of the text, under the text (its halo
     // under the line, so it shows over the map).

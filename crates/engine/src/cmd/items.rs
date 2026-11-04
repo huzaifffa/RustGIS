@@ -546,7 +546,6 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"imported": n}))
 }
 
-/// The project without its features (layer schemas, symbology, layouts and styles stay).
 /// Copies `old`'s saved label moves into the class of the same name in `new` (Default into
 /// Default), after dropping `new`'s own; returns how many of `new`'s were dropped, and how many
 /// of `old`'s had no class to go to.
@@ -567,18 +566,28 @@ fn carry_moves(old: &rustgis_map::symbology::Labeling, new: &mut rustgis_map::sy
     (foreign, lost)
 }
 
-/// The project without its data, and how many saved label moves went with the features.
+/// The project without its features (layer schemas, symbology, layouts and styles stay), and how
+/// many saved label moves went with them.
 fn template(p: &Project) -> (Project, usize) {
     let mut t = p.clone();
     t.gp_history.clear();
+    // Saved label moves name features, and a template has none: the layers', the saved styles'
+    // and the offline snapshots' all go.
     let mut moves = 0usize;
+    let labels = t
+        .maps
+        .iter_mut()
+        .chain(t.offline_areas.iter_mut().map(|a| &mut a.data))
+        .flat_map(|m| m.layers.iter_mut().map(|l| &mut l.labels))
+        .chain(t.styles.iter_mut().map(|s| &mut s.labels));
+    for labels in labels {
+        for c in labels.classes.iter_mut().chain(std::iter::once(&mut labels.default)) {
+            moves = moves.saturating_add(c.moved.len());
+            c.moved.clear();
+        }
+    }
     for m in &mut t.maps {
         for l in &mut m.layers {
-            // Saved label moves name features, and a template has none.
-            for c in l.labels.classes.iter_mut().chain(std::iter::once(&mut l.labels.default)) {
-                moves = moves.saturating_add(c.moved.len());
-                c.moved.clear();
-            }
             l.dataset.features.clear();
             l.selection.clear();
             l.dataset.source = None;
