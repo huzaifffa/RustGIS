@@ -102,7 +102,8 @@ pub fn commands() -> Vec<C> {
             // Saved moves name features by id: the style's belong to the layer it was made from,
             // so this layer keeps its own, in the class of the same name (Default in Default).
             let mut labels = st.labels;
-            let (foreign, lost) = carry_moves(&mut l.labels, &mut labels);
+            let (foreign, lost) = carry_moves(&l.labels, &mut labels);
+            // Compared with the layer as it stands, its moves still in it.
             let relock = !super::labels::lock_holds(l, &labels);
             l.labels = labels;
             // The label field stays if the style's isn't in this layer.
@@ -546,25 +547,21 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// The project without its features (layer schemas, symbology, layouts and styles stay).
-/// Moves `old`'s saved label moves into the class of the same name in `new` (Default into
+/// Copies `old`'s saved label moves into the class of the same name in `new` (Default into
 /// Default), after dropping `new`'s own; returns how many of `new`'s were dropped, and how many
 /// of `old`'s had no class to go to.
-fn carry_moves(old: &mut rustgis_map::symbology::Labeling, new: &mut rustgis_map::symbology::Labeling) -> (usize, usize) {
+fn carry_moves(old: &rustgis_map::symbology::Labeling, new: &mut rustgis_map::symbology::Labeling) -> (usize, usize) {
     let mut foreign = 0usize;
     for c in new.classes.iter_mut().chain(std::iter::once(&mut new.default)) {
         foreign = foreign.saturating_add(c.moved.len());
         c.moved.clear();
     }
-    new.default.moved = std::mem::take(&mut old.default.moved);
+    new.default.moved.clone_from(&old.default.moved);
     let mut lost = 0usize;
-    for c in &mut old.classes {
-        let moved = std::mem::take(&mut c.moved);
-        if moved.is_empty() {
-            continue;
-        }
+    for c in old.classes.iter().filter(|c| !c.moved.is_empty()) {
         match new.classes.iter_mut().find(|n| n.name.eq_ignore_ascii_case(&c.name) && n.moved.is_empty()) {
-            Some(n) => n.moved = moved,
-            None => lost = lost.saturating_add(moved.len()),
+            Some(n) => n.moved.clone_from(&c.moved),
+            None => lost = lost.saturating_add(c.moved.len()),
         }
     }
     (foreign, lost)

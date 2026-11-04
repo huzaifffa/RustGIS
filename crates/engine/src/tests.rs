@@ -4008,6 +4008,12 @@ fn applying_a_style_keeps_the_layers_own_label_moves() {
     s.run("style.new", &json!({"layer": id, "name": "Moved"})).unwrap();
     s.run("labels.move", &json!({"layer": id, "feature": ids[0], "to": null})).unwrap();
     s.run("labels.move", &json!({"layer": id, "feature": ids[1], "to": [2, 2]})).unwrap();
+    // A style that places the labels as they are keeps them locked, the layer's moves and all.
+    s.run("style.new", &json!({"layer": id, "name": "Same"})).unwrap();
+    s.map_mut().label_lock = Some(vec![((id, 0, 0, 0), rustgis_map::LockedPlace::default())]);
+    s.run("style.apply", &json!({"layer": id, "name": "Same"})).unwrap();
+    assert!(s.map().label_lock.is_some(), "placement unchanged keeps the lock");
+    assert_eq!(s.map().layer(id).unwrap().labels.default.moved_to(ids[1]), Some([2.0, 2.0]));
     let mark = s.notice_mark();
     s.run("style.apply", &json!({"layer": id, "name": "Plain"})).unwrap();
     assert_eq!(said(&s, mark), 0, "{:?}", s.notices_since(mark));

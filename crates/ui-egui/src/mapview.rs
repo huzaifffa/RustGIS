@@ -2455,7 +2455,11 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         let moved = app.map.moving_label.as_ref().zip(end).map(|(m, end)| moved_label(&m.label, end - origin));
         if resp.drag_stopped() {
             app.map.drag = None;
-            let to = moved.and_then(|l| screen_to_lonlat(app, rect, rect.min + vec2(l.x, l.y)));
+            let to = moved.as_ref().and_then(|l| screen_to_lonlat(app, rect, rect.min + vec2(l.x, l.y)));
+            // Over a tilted map's sky or past the globe's edge there is no place to keep it at.
+            if moved.is_some() && to.is_none() {
+                app.session.notify(tl!("No place there to move the label to; it stays where it was."), true);
+            }
             if let (Some(c), Some(m)) = (to, app.map.moving_label.take())
                 && let Err(e) = app.run("labels.move", json!({"layer": m.layer, "class": m.class, "feature": m.feature, "to": [c.x, c.y]}))
             {
