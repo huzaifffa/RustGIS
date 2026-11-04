@@ -244,12 +244,15 @@ pub fn commands() -> Vec<C> {
                 .filter(|l| !l.dataset.windowed)
                 .filter(|l| l.labels.in_order().any(|c| c.moved.len() >= rustgis_map::symbology::MAX_MOVED_LABELS))
                 .map(|l| l.dataset.features.iter().map(|f| f.id).collect());
+            let mut pruned = 0usize;
             let r = with_labels(s, p, |labels| {
                 let c = class_in(labels, p)?;
                 if let Some(live) = &live
                     && c.moved.len() >= rustgis_map::symbology::MAX_MOVED_LABELS
                 {
+                    let before = c.moved.len();
                     c.moved.retain(|m| live.contains(&m.id));
+                    pruned = before - c.moved.len();
                 }
                 if c.move_label(feature, to) {
                     Ok(())
@@ -257,6 +260,9 @@ pub fn commands() -> Vec<C> {
                     Err(format!("a label class keeps at most {} labels moved", rustgis_map::symbology::MAX_MOVED_LABELS))
                 }
             })?;
+            if pruned > 0 {
+                s.notify(format!("{pruned} saved label move(s) of features no longer in the layer dropped to make room"), false);
+            }
             // Locked, the labels are locked again where they are placed next: the one moved may
             // not have been placed when the lock was taken.
             s.map_mut().label_lock = None;
@@ -464,11 +470,11 @@ pub(crate) fn same_class_list(a: &Labeling, b: &Labeling) -> bool {
 }
 
 /// Whether a lock taken with the layer's labels still names those of `b`: the same classes, listed
-/// alike, putting their point labels in the same places, with unchanged overlap and callouts.
+/// alike, putting their point labels in the same places, with unchanged overlap, callouts and moves.
 pub(crate) fn lock_holds(l: &Layer, b: &Labeling) -> bool {
     same_class_list(&l.labels, b)
         && same_places(l, b)
-        && l.labels.in_order().zip(b.in_order()).all(|(x, y)| x.show_all == y.show_all && x.callout == y.callout)
+        && l.labels.in_order().zip(b.in_order()).all(|(x, y)| x.show_all == y.show_all && x.callout == y.callout && x.moved == y.moved)
 }
 
 /// Whether the layer's classes and those of `b` (listed alike) put their labels in the same places.

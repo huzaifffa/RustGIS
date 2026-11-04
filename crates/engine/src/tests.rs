@@ -3325,6 +3325,25 @@ fn moved_labels_preserve_off_window_features_at_the_cap() {
     assert!(error.contains("not present"), "{error}");
 }
 
+/// A class at its most drops the saved moves of features no longer in the layer to make room, and
+/// says how many; a class with room drops none and says nothing.
+#[test]
+fn moved_labels_of_removed_features_make_room_with_a_notice() {
+    use rustgis_map::symbology::{MAX_MOVED_LABELS, MovedLabel};
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let fid = s.map().layer(id).unwrap().dataset.features.first().unwrap().id;
+    let layer = s.map_mut().layer_mut(id).unwrap();
+    layer.labels.default.moved = (0..MAX_MOVED_LABELS).map(|i| MovedLabel { id: 1_000_000 + i as u64, at: [1.0, 1.0] }).collect();
+    let mark = s.notice_mark();
+    s.run("labels.move", &json!({"layer": id, "feature": fid, "to": [2, 2]})).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().labels.default.moved.len(), 1);
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("10000 saved label move(s) of features no longer in the layer")));
+    let mark = s.notice_mark();
+    s.run("labels.move", &json!({"layer": id, "feature": fid, "to": [3, 3]})).unwrap();
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("dropped to make room")));
+}
+
 /// Labels are moved by hand by feature id and put back, one class's or all; bad input is refused.
 #[test]
 fn labels_are_moved_by_command_and_reset() {
@@ -4068,6 +4087,25 @@ fn service_refresh_resets_saved_label_moves_with_a_notice() {
     let mark = s.notice_mark();
     s.run("service.refresh", &json!({"layer":id})).unwrap();
     assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("saved label move(s) reset")));
+}
+
+/// A refresh whose service no longer offers a layer says how many saved moves went with it.
+#[test]
+fn service_refresh_says_how_many_moves_go_with_a_dropped_layer() {
+    let server = ogc_server::Server::group_fixture();
+    let mut s = Session::new(Project::default());
+    s.run("service.import", &json!({"url":server.root()})).unwrap();
+    let routes = s.map().layer_by_name("Routes").unwrap().id;
+    let feature = s.map().layer(routes).unwrap().dataset.features[0].id;
+    s.run("labels.move", &json!({"layer":routes,"feature":feature,"to":[1,1]})).unwrap();
+    // The service now offers only Places.
+    let items = json!({"rel": "items", "type": "application/geo+json", "href": "collections/places/items?key=fixture-key"});
+    server.set(ogc_server::CATALOG, &json!({"collections": [{"id": "places", "title": "Places", "links": [items]}]}).to_string());
+    let places = s.map().layer_by_name("Places").unwrap().id;
+    let mark = s.notice_mark();
+    s.run("service.refresh", &json!({"layer":places})).unwrap();
+    assert!(s.map().layer_by_name("Routes").is_none());
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("1 saved label move(s) dropped with layers")));
 }
 
 /// Label classes by command (#618): added from Default and checked before it, renamed, given

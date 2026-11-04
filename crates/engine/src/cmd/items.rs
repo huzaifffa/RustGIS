@@ -437,7 +437,12 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
             vec![m]
         }
         Err(_) => match Project::from_import_json(&text, dir.as_deref()) {
-            Ok(project) => project.maps,
+            Ok(mut project) => {
+                for notice in std::mem::take(&mut project.label_read_notices) {
+                    s.notify(notice, false);
+                }
+                project.maps
+            }
             Err(_) => {
                 super::connections::restore_active(s);
                 return Err("not a RustGIS map file, project or package".into());
@@ -495,7 +500,11 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
         super::connections::clear_active();
         let project = Project::from_import_json(&text, None);
         super::connections::restore_active(s);
-        project.map_err(|_| "not a RustGIS layer file, map file or project".to_string())?.maps.into_iter().flat_map(|m| m.layers).collect()
+        let mut project = project.map_err(|_| "not a RustGIS layer file, map file or project".to_string())?;
+        for notice in std::mem::take(&mut project.label_read_notices) {
+            s.notify(notice, false);
+        }
+        project.maps.into_iter().flat_map(|m| m.layers).collect()
     };
     let mut n = 0;
     for l in layers.into_iter().filter(|l| !l.is_raster() && l.geometry_type() != GeometryType::None).take(1000) {

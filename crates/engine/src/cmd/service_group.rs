@@ -374,7 +374,14 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
     let ids: Vec<u32> = children.iter().map(|c| c.layer).collect();
     if child_id.is_none() {
         let gone: Vec<u32> = old.children.iter().map(|c| c.layer).filter(|id| !ids.contains(id)).collect();
+        let mut gone_moved = 0;
+        for l in s.map().layers.iter().filter(|l| gone.contains(&l.id)) {
+            gone_moved += l.labels.in_order().map(|class| class.moved.len()).sum::<usize>();
+        }
         crate::cmd::layer::drop_layers(s, &gone);
+        if gone_moved > 0 {
+            s.notify(format!("{gone_moved} saved label move(s) dropped with layers the refreshed service no longer offers"), false);
+        }
         if let Some(lock) = &mut s.map_mut().label_lock {
             lock.retain(|((id, _, _, _), _)| !gone.contains(id));
         }
