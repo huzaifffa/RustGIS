@@ -107,9 +107,13 @@ struct File {
     styles: Vec<Layer>,
 }
 
-/// Zero and null explicitly disable callouts; other lengths must fit the supported range.
+/// Zero, false and null explicitly disable callouts; other lengths must fit the supported range.
 fn adjusted_callout(value: Option<&serde_json::Value>) -> bool {
-    value.is_some_and(|v| v.as_f64().is_none_or(|n| n != 0.0 && !rustgis_map::symbology::CALLOUT_REACH.contains(&n)))
+    value.is_some_and(|v| {
+        !v.is_null()
+            && v.as_bool() != Some(false)
+            && v.as_f64().is_none_or(|n| n != 0.0 && !rustgis_map::symbology::CALLOUT_REACH.contains(&n))
+    })
 }
 
 /// Whether a "Show all labels" setting is something other than true or false (null is none).

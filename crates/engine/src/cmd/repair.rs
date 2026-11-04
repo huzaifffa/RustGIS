@@ -100,7 +100,10 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
             let l = s.map_mut().layer_mut(id).ok_or("the layer no longer exists")?;
             let moved = l.replace_source(new);
             let name = l.name.clone();
-            // A lock's feature ids and callout offsets belong to the old source too.
+            // A lock's feature ids and callout offsets belong to the old source too. The whole
+            // lock goes, not just this layer's entries: while locked only the labels it names are
+            // drawn, so dropping this layer's alone would hide its labels until the lock is
+            // taken again. Cleared, every label is locked again where it is placed next.
             s.map_mut().label_lock = None;
             s.map_mut().label_lock_line_anchors.clear();
             if moved > 0 {

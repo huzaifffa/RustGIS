@@ -3972,6 +3972,13 @@ fn opening_projects_reports_moved_label_and_callout_adjustments() {
     let clean = serde_json::to_string(&project).unwrap();
     let clean_session = Session::new(Project::from_json(&clean).unwrap());
     assert!(clean_session.notices.is_empty());
+    // Callouts written off (false, null or 0) are clean too.
+    for off in [json!(false), json!(null), json!(0)] {
+        let mut v: Value = serde_json::from_str(&clean).unwrap();
+        v["maps"][0]["layers"][0]["labels"]["callout"] = off.clone();
+        v["styles"][0]["labels"]["callout"] = off.clone();
+        assert!(Session::new(Project::from_json(&v.to_string()).unwrap()).notices.is_empty(), "{off}");
+    }
     let mut damaged: Value = serde_json::from_str(&clean).unwrap();
     let labels = &mut damaged["maps"][0]["layers"][0]["labels"];
     labels["moved"] = json!([

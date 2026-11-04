@@ -5381,6 +5381,11 @@ fn place_labels_with_previews(
             if let Some(anchor) = line.as_ref().and_then(|line| line.anchors.get(i)).copied().flatten() {
                 out.line_anchors.push((key, anchor));
             }
+            // Its feature stays where it is: the anchor is its offset from the label as placed
+            // (an alternative place, a callout or a lock may have moved it).
+            if let Some(f) = feature {
+                l.collide.callout_anchor = Some([f[0] - l.x, f[1] - l.y]);
+            }
             out.labels.push(l);
             out.keys.push((key, rustgis_map::LockedPlace { place: u8::try_from(i).unwrap_or(u8::MAX), callout: moved_by }));
         }
@@ -5752,6 +5757,10 @@ mod tests {
         assert!(first.collide.callout.is_none(), "in its own spot, no line");
         let [x0, y0, x1, y1] = second.collide.callout.expect("a callout's line");
         assert!(((second.x + x0) - 100.0).abs() < 1e-3 && ((second.y + y0) - 60.0).abs() < 1e-3, "it starts at the feature");
+        // Its anchor names the feature from where it was moved to, as a drag's preview reads it.
+        let [ax, ay] = second.collide.callout_anchor.expect("an anchor");
+        assert!(((second.x + ax) - 100.0).abs() < 1e-3 && ((second.y + ay) - 60.0).abs() < 1e-3, "anchor follows the move");
+        assert_eq!(callout_to(second), second.collide.callout, "the preview's line is the placed one");
         let len = (x1 - x0).hypot(y1 - y0);
         assert!((1.0..=40.0).contains(&len), "{len} points");
         let (a, b) = (label_boxes(first).0, label_boxes(second).0);
