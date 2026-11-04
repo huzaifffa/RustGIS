@@ -2635,6 +2635,9 @@ pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     if layer.dataset.source.as_deref().is_some_and(|source| source.starts_with("geolibre-pending:")) {
         return Err("a layer file cannot contain runtime GeoLibre download reservations".into());
     }
+    for notice in crate::project::label_losses::layer_notices(text, &layer) {
+        s.notify(notice, false);
+    }
     // A binding in a file is no authority to use a login here.
     crate::s3_connections::clear_bindings(layer.addresses_mut());
     // A fresh id and a unique name in this map; the rest goes through project repair.

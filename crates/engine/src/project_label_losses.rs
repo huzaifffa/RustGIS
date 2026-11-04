@@ -65,6 +65,8 @@ struct Class {
     moved: MoveCount,
     #[serde(default)]
     callout: Option<serde_json::Value>,
+    #[serde(default)]
+    show_all: Option<serde_json::Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -73,6 +75,8 @@ struct Labels {
     moved: MoveCount,
     #[serde(default)]
     callout: Option<serde_json::Value>,
+    #[serde(default)]
+    show_all: Option<serde_json::Value>,
     #[serde(default)]
     classes: Vec<Class>,
 }
@@ -108,39 +112,70 @@ fn adjusted_callout(value: Option<&serde_json::Value>) -> bool {
     value.is_some_and(|v| v.as_f64().is_none_or(|n| n != 0.0 && !rustgis_map::symbology::CALLOUT_REACH.contains(&n)))
 }
 
-/// Compare raw record counts with retained state, including offline snapshots; one notice per kind.
-pub(super) fn notices(text: &str, project: &Project) -> Result<Vec<String>, String> {
-    let file: File = serde_json::from_str(text).map_err(|e| format!("could not read project label settings: {e}"))?;
-    let (mut moves, mut callouts) = (0usize, 0usize);
-    for layer in file.maps.iter().chain(file.offline_areas.iter().map(|a| &a.data)).flat_map(|m| &m.layers).chain(file.styles.iter()) {
+/// Whether a "Show all labels" setting is something other than true or false (null is none).
+fn damaged_flag(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(|v| !v.is_boolean() && !v.is_null())
+}
+
+/// Count what the raw layers hold against what the read labels kept; one notice per kind, each
+/// naming the item read (`name`) and what it was (`what`: "the project", "the map file", ...).
+fn count<'a>(
+    raw: impl Iterator<Item = &'a Layer>,
+    retained: impl Iterator<Item = &'a rustgis_map::symbology::Labeling>,
+    name: &str,
+    what: &str,
+) -> Vec<String> {
+    let (mut moves, mut callouts, mut flags) = (0usize, 0usize, 0usize);
+    for layer in raw {
         let labels = &layer.labels;
         moves = moves.saturating_add(labels.moved.0);
         callouts = callouts.saturating_add(usize::from(adjusted_callout(labels.callout.as_ref())));
+        flags = flags.saturating_add(usize::from(damaged_flag(labels.show_all.as_ref())));
         for class in &labels.classes {
             moves = moves.saturating_add(class.moved.0);
             callouts = callouts.saturating_add(usize::from(adjusted_callout(class.callout.as_ref())));
+            flags = flags.saturating_add(usize::from(damaged_flag(class.show_all.as_ref())));
         }
     }
+    let retained = retained.flat_map(|labels| labels.in_order()).map(|c| c.moved.len()).fold(0usize, usize::saturating_add);
+    let dropped = moves.saturating_sub(retained);
+    let mut messages = Vec::new();
+    if dropped > 0 {
+        messages.push(format!("{name}: {dropped} invalid, duplicate or excess moved-label entry/setting(s) ignored while opening {what}"));
+    }
+    if callouts > 0 {
+        messages.push(format!("{name}: {callouts} callout length setting(s) adjusted or disabled while opening {what}"));
+    }
+    if flags > 0 {
+        messages
+            .push(format!("{name}: {flags} \"show all labels\" setting(s) that were not true or false read as off while opening {what}"));
+    }
+    messages
+}
+
+/// Compare raw record counts with retained state, including offline snapshots; one notice per kind.
+pub(super) fn notices(text: &str, project: &Project) -> Result<Vec<String>, String> {
+    let file: File = serde_json::from_str(text).map_err(|e| format!("could not read project label settings: {e}"))?;
+    let raw = file.maps.iter().chain(file.offline_areas.iter().map(|a| &a.data)).flat_map(|m| &m.layers).chain(file.styles.iter());
     let retained = project
         .maps
         .iter()
         .chain(project.offline_areas.iter().map(|a| &a.data))
         .flat_map(|m| &m.layers)
         .map(|l| &l.labels)
-        .chain(project.styles.iter().map(|s| &s.labels))
-        .flat_map(|labels| labels.in_order())
-        .map(|c| c.moved.len())
-        .fold(0usize, usize::saturating_add);
-    let dropped = moves.saturating_sub(retained);
-    let mut messages = Vec::new();
-    if dropped > 0 {
-        messages.push(format!(
-            "{}: {dropped} invalid, duplicate or excess moved-label entry/setting(s) ignored while opening the project",
-            project.name
-        ));
-    }
-    if callouts > 0 {
-        messages.push(format!("{}: {callouts} callout length setting(s) adjusted or disabled while opening the project", project.name));
-    }
-    Ok(messages)
+        .chain(project.styles.iter().map(|s| &s.labels));
+    Ok(count(raw, retained, &project.name, "the project"))
+}
+
+/// The same audit for a map file read on its own; unreadable label settings give no notice
+/// (the map itself was read, so its labels were too).
+pub(crate) fn map_notices(text: &str, map: &rustgis_map::Map) -> Vec<String> {
+    let Ok(raw) = serde_json::from_str::<Map>(text) else { return Vec::new() };
+    count(raw.layers.iter(), map.layers.iter().map(|l| &l.labels), &map.name, "the map file")
+}
+
+/// The same audit for a layer file read on its own.
+pub(crate) fn layer_notices(text: &str, layer: &rustgis_map::Layer) -> Vec<String> {
+    let Ok(raw) = serde_json::from_str::<Layer>(text) else { return Vec::new() };
+    count(std::iter::once(&raw), std::iter::once(&layer.labels), &layer.name, "the layer file")
 }

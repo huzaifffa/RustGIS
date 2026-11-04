@@ -473,8 +473,11 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   `labels.resetMoved={"layer": "Cities", "all": true}`).
   Deleting a feature removes its saved move; Undo restores it. Service refresh and Repair Data Source reset saved
   moves and old label locks because replacement data can reuse feature ids, with a counted notice
-  and undo restoration. Opening a project reports invalid, duplicate or excess moved-label entries
-  that were ignored, and callout lengths that were adjusted. Clean settings give no such notice.
+  and undo restoration. Opening a project, importing a map or styles, or adding a layer file
+  reports invalid, duplicate or excess moved-label entries that were ignored, callout lengths that
+  were adjusted, and Show all labels settings that were not true or false. A callout length given
+  to `labels.placement` outside 5 to 500 points is brought within range with a notice. Clean
+  settings give no such notice.
 - **Font**: the labels' font family, any installed on the computer (Labeling pane › Symbol
   › **Font**; type part of a name to find it), or the label font the interface uses. Bold and
   italic take the family's own bold and italic faces where it has them. The family is saved by

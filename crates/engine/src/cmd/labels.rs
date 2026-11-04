@@ -176,6 +176,13 @@ pub fn commands() -> Vec<C> {
                     _ => return Err("callout must be true or false, or its longest line in points".into()),
                 },
             };
+            // A length outside the range is brought within it, and says so.
+            let callout_note = match (&callout, p.get("callout").and_then(number)) {
+                (Some(Callout::Reach(kept)), Some(asked)) if !rustgis_map::symbology::CALLOUT_REACH.contains(&asked) => {
+                    Some(format!("callout length {asked} points adjusted to {kept} (callouts are 5 to 500 points long)"))
+                }
+                _ => None,
+            };
             // A label tries other places when its own is taken: round its point (#1011), or along
             // its line (#1187).
             let others = match p.get("otherPositions") {
@@ -185,7 +192,7 @@ pub fn commands() -> Vec<C> {
             };
             let id = s.layer_id(p)?;
             let (points, lines) = points_and_lines(s.map().layer(id).ok_or("no such layer")?);
-            with_labels(s, p, |labels| {
+            let done = with_labels(s, p, |labels| {
                 let c = class_in(labels, p)?;
                 if let Some(pos) = pos {
                     c.placement = pos;
@@ -214,7 +221,11 @@ pub fn commands() -> Vec<C> {
                     return Err("otherPositions is for points, and for lines placed parallel or curved without a repeat".into());
                 }
                 Ok(())
-            })
+            })?;
+            if let Some(note) = callout_note {
+                s.notify(note, false);
+            }
+            Ok(done)
         })
         .when(need_feature_layer)
         .params(

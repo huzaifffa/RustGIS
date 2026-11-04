@@ -434,6 +434,9 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
             if let Some(d) = dir.as_deref().and_then(Path::to_str) {
                 crate::project::resolve_file_paths(d, m.file_paths_mut());
             }
+            for notice in crate::project::label_losses::map_notices(&text, &m) {
+                s.notify(notice, false);
+            }
             vec![m]
         }
         Err(_) => match Project::from_import_json(&text, dir.as_deref()) {
@@ -492,8 +495,14 @@ fn add_style(s: &mut Session, mut item: StyleItem) {
 fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
     let text = read_text(p)?;
     let layers: Vec<Layer> = if let Ok(l) = serde_json::from_str::<Layer>(&text) {
+        for notice in crate::project::label_losses::layer_notices(&text, &l) {
+            s.notify(notice, false);
+        }
         vec![l]
     } else if let Ok(m) = serde_json::from_str::<Map>(&text) {
+        for notice in crate::project::label_losses::map_notices(&text, &m) {
+            s.notify(notice, false);
+        }
         m.layers
     } else {
         // A project parse opens sources even though this import only takes their styles.

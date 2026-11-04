@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::GpRecord;
 
 #[path = "project_label_losses.rs"]
-mod label_losses;
+pub(crate) mod label_losses;
 
 /// A map export cannot keep runtime-only download reservations, even in a larger project.
 pub(crate) fn ensure_map_imports_complete(map: &Map) -> Result<(), String> {

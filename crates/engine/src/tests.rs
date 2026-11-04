@@ -3434,10 +3434,14 @@ fn labels_show_all_and_take_callouts() {
     // On: the default length, then one given, kept within range; on again keeps it.
     s.run("labels.placement", &json!({"layer": "Cities", "callout": true})).unwrap();
     assert_eq!(class(&s).1, Some(rustgis_map::symbology::DEFAULT_CALLOUT));
+    let adjusted = |s: &Session, mark| s.notices_since(mark).iter().filter(|n| n.text.contains("callout length")).count();
+    let mark = s.notice_mark();
     s.run("labels.placement", &json!({"layer": "Cities", "callout": 80})).unwrap();
     assert_eq!(class(&s).1, Some(80.0));
+    assert_eq!(adjusted(&s, mark), 0, "a length in range says nothing");
     s.run("labels.placement", &json!({"layer": "Cities", "callout": 99999})).unwrap();
     assert_eq!(class(&s).1, Some(500.0), "within its range");
+    assert_eq!(adjusted(&s, mark), 1, "and says it was adjusted");
     s.run("labels.placement", &json!({"layer": "Cities", "callout": true})).unwrap();
     assert_eq!(class(&s).1, Some(500.0), "on again keeps its length");
     // Saved with the layer, and read back.
@@ -3669,7 +3673,7 @@ fn labels_take_other_positions_along_lines() {
     // Turned on or off, the labels are locked again, with the anchors of their places on the line.
     let key = (id, 0, 0, 0);
     for on in [false, true] {
-        s.map_mut().label_lock = Some(vec![(key, 1)]);
+        s.map_mut().label_lock = Some(vec![(key, rustgis_map::LockedPlace { place: 1, callout: None })]);
         s.map_mut().label_lock_line_anchors.insert(key, Default::default());
         s.run("labels.placement", &json!({"layer": "Rivers", "class": "Big", "otherPositions": on})).unwrap();
         assert!(s.map().label_lock.is_none() && s.map().label_lock_line_anchors.is_empty(), "{on}: locked again");
@@ -3806,7 +3810,7 @@ fn a_line_class_flag_with_no_effect_keeps_the_lock() {
     let id = s.map().layer_by_name("Rivers").unwrap().id;
     s.run("labels.placement", &json!({"layer": "Rivers", "position": "curved", "otherPositions": true})).unwrap();
     let held = |s: &mut Session, layer: u32, name: &str, change: Value| {
-        s.map_mut().label_lock = Some(vec![((layer, 0, 0, 0), 1)]);
+        s.map_mut().label_lock = Some(vec![((layer, 0, 0, 0), rustgis_map::LockedPlace { place: 1, callout: None })]);
         let mut p = change;
         p["layer"] = json!(name);
         s.run("labels.placement", &p).unwrap();
@@ -3968,18 +3972,20 @@ fn opening_projects_reports_moved_label_and_callout_adjustments() {
         {"id":-1,"at":[2.0,3.0]}, {"id":1.5,"at":[2.0,3.0]}, {"id":2,"at":[2.0,100.0]}
     ]);
     labels["callout"] = json!(900);
+    labels["show_all"] = json!("yes");
     damaged["styles"][0]["labels"]["moved"] = json!("damaged");
     damaged["styles"][0]["labels"]["callout"] = json!(-1);
     let text = damaged.to_string();
     let loaded = Project::from_json(&text).unwrap();
     assert_eq!(loaded.maps[0].layers[0].labels.default.moved_to(1), Some([4.0, 5.0]));
     let startup = Session::new(loaded);
-    assert_eq!(startup.notices.len(), 2);
+    assert_eq!(startup.notices.len(), 3);
     assert!(startup.notices.iter().any(|n| n.text.contains("5 invalid, duplicate or excess moved-label")));
     assert!(startup.notices.iter().any(|n| n.text.contains("2 callout length setting(s) adjusted")));
+    assert!(startup.notices.iter().any(|n| n.text.contains("1 \"show all labels\" setting(s)")));
     let mut opened = Session::new(Project::default());
     opened.run("project.openText", &json!({"text":text})).unwrap();
-    assert_eq!(opened.notices.iter().filter(|n| n.text.contains("while opening the project")).count(), 2);
+    assert_eq!(opened.notices.iter().filter(|n| n.text.contains("while opening the project")).count(), 3);
     assert!(!serde_json::to_string(&opened.project).unwrap().contains("label_read_notices"));
     let mut excess: Value = serde_json::from_str(&clean).unwrap();
     excess["styles"][0]["labels"]["moved"] =
@@ -3987,6 +3993,44 @@ fn opening_projects_reports_moved_label_and_callout_adjustments() {
     let capped = Session::new(Project::from_json(&excess.to_string()).unwrap());
     assert_eq!(capped.notices.len(), 1);
     assert!(capped.notices[0].text.contains("1 invalid, duplicate or excess moved-label"));
+}
+
+/// A map file or layer file read on its own reports discarded label settings as a project does
+/// (Import map, Import Styles, Add Layer File); clean files stay quiet.
+#[test]
+fn map_and_layer_files_report_label_setting_losses() {
+    let s = world();
+    let map = serde_json::to_value(s.map()).unwrap();
+    let layer = serde_json::to_value(s.map().layer_by_name("Cities").unwrap()).unwrap();
+    let damage = |labels: &mut Value| {
+        labels["moved"] = json!("damaged");
+        labels["callout"] = json!(900);
+        labels["show_all"] = json!(3);
+    };
+    let mut bad_map = map.clone();
+    let i = bad_map["layers"].as_array().unwrap().iter().position(|l| l["name"] == "Cities").unwrap();
+    damage(&mut bad_map["layers"][i]["labels"]);
+    let mut bad_layer = layer.clone();
+    damage(&mut bad_layer["labels"]);
+    let said = |cmd: &str, text: &Value| {
+        let mut s = world();
+        let mark = s.notice_mark();
+        s.run(cmd, &json!({"text": text.to_string()})).unwrap();
+        s.notices_since(mark).iter().filter(|n| n.text.contains("while opening the")).map(|n| n.text.clone()).collect::<Vec<_>>()
+    };
+    for (cmd, clean, bad) in [
+        ("map.import", &map, &bad_map),
+        ("style.import", &map, &bad_map),
+        ("style.import", &layer, &bad_layer),
+        ("layer.addLayerFile", &layer, &bad_layer),
+    ] {
+        assert!(said(cmd, clean).is_empty(), "{cmd}: {:?}", said(cmd, clean));
+        let notes = said(cmd, bad);
+        assert_eq!(notes.len(), 3, "{cmd}: {notes:?}");
+        assert!(notes.iter().any(|n| n.contains("1 invalid, duplicate or excess moved-label")), "{cmd}: {notes:?}");
+        assert!(notes.iter().any(|n| n.contains("1 callout length")), "{cmd}: {notes:?}");
+        assert!(notes.iter().any(|n| n.contains("1 \"show all labels\"")), "{cmd}: {notes:?}");
+    }
 }
 
 /// A streamed layer holds only the window in view: a lock's entry for a feature outside it stays
