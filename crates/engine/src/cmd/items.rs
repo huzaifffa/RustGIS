@@ -99,8 +99,12 @@ pub fn commands() -> Vec<C> {
             }
             l.renderer = st.renderer;
             let field = l.labels.default.field.clone();
-            let relock = !super::labels::lock_holds(l, &st.labels);
-            l.labels = st.labels;
+            // Saved moves name features by id: the style's belong to the layer it was made from,
+            // so this layer keeps its own, in the class of the same name (Default in Default).
+            let mut labels = st.labels;
+            let (foreign, lost) = carry_moves(&mut l.labels, &mut labels);
+            let relock = !super::labels::lock_holds(l, &labels);
+            l.labels = labels;
             // The label field stays if the style's isn't in this layer.
             if l.dataset.field_index(&l.labels.default.field).is_none() {
                 l.labels.default.field = field;
@@ -110,6 +114,12 @@ pub fn commands() -> Vec<C> {
             if relock {
                 s.map_mut().label_lock = None;
                 s.map_mut().label_lock_line_anchors.clear();
+            }
+            if foreign > 0 {
+                s.notify(format!("{foreign} saved label move(s) in style {name} not applied: they name another layer's features"), false);
+            }
+            if lost > 0 {
+                s.notify(format!("{lost} saved label move(s) dropped with label classes style {name} doesn't have"), false);
             }
             Ok(Value::Null)
         })
@@ -536,11 +546,42 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// The project without its features (layer schemas, symbology, layouts and styles stay).
-fn template(p: &Project) -> Project {
+/// Moves `old`'s saved label moves into the class of the same name in `new` (Default into
+/// Default), after dropping `new`'s own; returns how many of `new`'s were dropped, and how many
+/// of `old`'s had no class to go to.
+fn carry_moves(old: &mut rustgis_map::symbology::Labeling, new: &mut rustgis_map::symbology::Labeling) -> (usize, usize) {
+    let mut foreign = 0usize;
+    for c in new.classes.iter_mut().chain(std::iter::once(&mut new.default)) {
+        foreign = foreign.saturating_add(c.moved.len());
+        c.moved.clear();
+    }
+    new.default.moved = std::mem::take(&mut old.default.moved);
+    let mut lost = 0usize;
+    for c in &mut old.classes {
+        let moved = std::mem::take(&mut c.moved);
+        if moved.is_empty() {
+            continue;
+        }
+        match new.classes.iter_mut().find(|n| n.name.eq_ignore_ascii_case(&c.name) && n.moved.is_empty()) {
+            Some(n) => n.moved = moved,
+            None => lost = lost.saturating_add(moved.len()),
+        }
+    }
+    (foreign, lost)
+}
+
+/// The project without its data, and how many saved label moves went with the features.
+fn template(p: &Project) -> (Project, usize) {
     let mut t = p.clone();
     t.gp_history.clear();
+    let mut moves = 0usize;
     for m in &mut t.maps {
         for l in &mut m.layers {
+            // Saved label moves name features, and a template has none.
+            for c in l.labels.classes.iter_mut().chain(std::iter::once(&mut l.labels.default)) {
+                moves = moves.saturating_add(c.moved.len());
+                c.moved.clear();
+            }
             l.dataset.features.clear();
             l.selection.clear();
             l.dataset.source = None;
@@ -559,7 +600,7 @@ fn template(p: &Project) -> Project {
     for t in &mut t.tables {
         t.features.clear();
     }
-    t
+    (t, moves)
 }
 
 /// Packages only completed imports; runtime download reservations cannot be reopened.
@@ -1065,7 +1106,10 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
         }
         "template" => {
             s.project.ensure_imports_complete()?;
-            let mut t = template(&s.project);
+            let (mut t, moves) = template(&s.project);
+            if moves > 0 {
+                s.notify(format!("{moves} saved label move(s) left out of the template, which keeps no features"), false);
+            }
             if let Some(n) = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
                 t.name = n.chars().take(200).collect();
             }

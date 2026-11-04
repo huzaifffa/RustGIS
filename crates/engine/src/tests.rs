@@ -3995,6 +3995,50 @@ fn opening_projects_reports_moved_label_and_callout_adjustments() {
     assert!(capped.notices[0].text.contains("1 invalid, duplicate or excess moved-label"));
 }
 
+/// A style's saved label moves name the features of the layer it was made from: applied, the
+/// layer keeps its own moves instead, and says what it left out; a style without moves is quiet.
+#[test]
+fn applying_a_style_keeps_the_layers_own_label_moves() {
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let ids: Vec<u64> = s.map().layer(id).unwrap().dataset.features.iter().take(2).map(|f| f.id).collect();
+    let said = |s: &Session, mark| s.notices_since(mark).iter().filter(|n| n.text.contains("label move(s)")).count();
+    s.run("style.new", &json!({"layer": id, "name": "Plain"})).unwrap();
+    s.run("labels.move", &json!({"layer": id, "feature": ids[0], "to": [1, 1]})).unwrap();
+    s.run("style.new", &json!({"layer": id, "name": "Moved"})).unwrap();
+    s.run("labels.move", &json!({"layer": id, "feature": ids[0], "to": null})).unwrap();
+    s.run("labels.move", &json!({"layer": id, "feature": ids[1], "to": [2, 2]})).unwrap();
+    let mark = s.notice_mark();
+    s.run("style.apply", &json!({"layer": id, "name": "Plain"})).unwrap();
+    assert_eq!(said(&s, mark), 0, "{:?}", s.notices_since(mark));
+    let mark = s.notice_mark();
+    s.run("style.apply", &json!({"layer": id, "name": "Moved"})).unwrap();
+    let labels = &s.map().layer(id).unwrap().labels.default;
+    assert_eq!((labels.moved_to(ids[0]), labels.moved_to(ids[1])), (None, Some([2.0, 2.0])));
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("1 saved label move(s) in style Moved not applied")));
+}
+
+/// A project template keeps no features, so no saved label moves either, and says so.
+#[test]
+fn a_project_template_leaves_out_label_moves() {
+    let dir = std::env::temp_dir().join(format!("rustgis-template-moves-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.rgis");
+    let mut s = world();
+    let mark = s.notice_mark();
+    s.run("project.saveTemplate", &json!({"path": path})).unwrap();
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("label move(s)")));
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let feature = s.map().layer(id).unwrap().dataset.features[0].id;
+    s.run("labels.move", &json!({"layer": id, "feature": feature, "to": [1, 1]})).unwrap();
+    let mark = s.notice_mark();
+    s.run("project.saveTemplate", &json!({"path": path})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("1 saved label move(s) left out of the template")));
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(!saved.to_string().contains("\"moved\""));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A map file or layer file read on its own reports discarded label settings as a project does
 /// (Import map, Import Styles, Add Layer File); clean files stay quiet.
 #[test]
@@ -4138,16 +4182,16 @@ fn service_refresh_resets_saved_label_moves_with_a_notice() {
 fn service_refresh_says_how_many_moves_go_with_a_dropped_layer() {
     let server = ogc_server::Server::group_fixture();
     let mut s = Session::new(Project::default());
-    s.run("service.import", &json!({"url":server.root()})).unwrap();
+    let group = s.run("service.import", &json!({"url":server.root()})).unwrap()["group"].clone();
     let routes = s.map().layer_by_name("Routes").unwrap().id;
     let feature = s.map().layer(routes).unwrap().dataset.features[0].id;
     s.run("labels.move", &json!({"layer":routes,"feature":feature,"to":[1,1]})).unwrap();
     // The service now offers only Places.
     let items = json!({"rel": "items", "type": "application/geo+json", "href": "collections/places/items?key=fixture-key"});
     server.set(ogc_server::CATALOG, &json!({"collections": [{"id": "places", "title": "Places", "links": [items]}]}).to_string());
-    let places = s.map().layer_by_name("Places").unwrap().id;
     let mark = s.notice_mark();
-    s.run("service.refresh", &json!({"layer":places})).unwrap();
+    // The whole group: a refresh of one layer leaves its siblings as they are.
+    s.run("service.refresh", &json!({"group":group})).unwrap();
     assert!(s.map().layer_by_name("Routes").is_none());
     assert!(s.notices_since(mark).iter().any(|n| n.text.contains("1 saved label move(s) dropped with layers")));
 }
