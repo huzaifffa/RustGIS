@@ -4237,8 +4237,8 @@ fn render_frame(
                                         text_allow_overlap: class.show_all,
                                         // Callouts: a label set by its feature (not along a line,
                                         // rotated or not) may move off a crowded spot, a line drawn
-                                        // back to it.
-                                        callout_reach: if !along_line(class.placement, g) && glyphs.is_empty() {
+                                        // back to it; one moved by hand, a line's too, keeps its line.
+                                        callout_reach: if moved.is_some() || (!along_line(class.placement, g) && glyphs.is_empty()) {
                                             class.callout.unwrap_or(0.0)
                                         } else {
                                             0.0
