@@ -4235,9 +4235,10 @@ fn render_frame(
                                     collide: rustgis_tiles::Collide {
                                         // Shown all: over the other labels where they crowd.
                                         text_allow_overlap: class.show_all,
-                                        // Callouts: a label set by its feature (not along a line)
-                                        // may move off a crowded spot, a line drawn back to it.
-                                        callout_reach: if angle.is_none() && glyphs.is_empty() {
+                                        // Callouts: a label set by its feature (not along a line,
+                                        // rotated or not) may move off a crowded spot, a line drawn
+                                        // back to it.
+                                        callout_reach: if !along_line(class.placement, g) && glyphs.is_empty() {
                                             class.callout.unwrap_or(0.0)
                                         } else {
                                             0.0
@@ -6496,6 +6497,27 @@ mod tests {
         let mut spots = 5;
         assert!(callout_spot(&text, [100.0, 100.0], 300.0, free, 1000.0, 200.0, &mut spots).is_none());
         assert_eq!(spots, 0);
+    }
+
+    /// A point label turned by its angle expression may still move off by a callout: only labels
+    /// along lines are left out of callouts (it was left out, silently, for any angle).
+    #[test]
+    fn a_rotated_point_label_moves_off_by_a_callout() {
+        let mut m = Map::new("Map");
+        let mut d = Dataset::new("pts", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        d.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text("First place".into())]);
+        d.push(Some(Geometry::Point(Coord::new(0.01, 0.0))), vec![Value::Text("Second place".into())]);
+        let id = m.add_dataset(d);
+        let l = m.layer_mut(id).unwrap();
+        l.labels.enabled = true;
+        l.labels.default.callout = Some(60.0);
+        l.labels.default.by.angle = Some("30".into());
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+        let labels = render(&mut m, &view).unwrap().labels;
+        assert_eq!(labels.len(), 2, "both drawn");
+        assert!(labels.iter().all(|l| l.angle.is_some()), "turned");
+        assert!(labels.iter().any(|l| l.collide.callout.is_some()), "one moved off by a callout");
     }
 
     /// Two points close together: the second label moves off by a callout. Locked, it keeps that
