@@ -467,6 +467,7 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
     for mut m in maps.into_iter().take(100) {
         // A binding in a file is no authority to use a login here.
         crate::s3_connections::clear_bindings(m.addresses_mut());
+        crate::project::clear_login_bindings(m.addresses_mut());
         let base = m.name.clone();
         let mut i = 1;
         while s.project.maps.iter().any(|o| o.name.eq_ignore_ascii_case(&m.name)) {
@@ -619,6 +620,8 @@ fn package_project(s: &Session) -> Result<Vec<u8>, String> {
         *m = embedded_map(m, &mut budget);
     }
     crate::project::strip_addresses(p.addresses_mut());
+    // Recorded parameters (history, tasks, models) lose only their login bindings, as when saving.
+    crate::project::clear_login_bindings(p.recorded_mut());
     let text = serde_json::to_string(&p).map_err(|e| e.to_string())?;
     let limit = crate::project::MAX_BYTES.min(rustgis_data::zip::MAX_TOTAL as u64);
     if text.len() as u64 > limit {
@@ -677,7 +680,16 @@ fn package_gp(s: &Session) -> Result<Vec<u8>, String> {
     if s.project.gp_history.is_empty() {
         return Err("no geoprocessing has been run yet".into());
     }
-    let mut entries = vec![("history.json".to_string(), serde_json::to_vec_pretty(&s.project.gp_history).map_err(|e| e.to_string())?)];
+    let mut history = s.project.gp_history.clone();
+    let mut addresses = Vec::new();
+    for record in &mut history {
+        crate::project::recorded_addresses(&mut record.params, &mut addresses);
+        if let Some((_, params)) = &mut record.command {
+            crate::project::recorded_addresses(params, &mut addresses);
+        }
+    }
+    crate::project::clear_login_bindings(addresses);
+    let mut entries = vec![("history.json".to_string(), serde_json::to_vec_pretty(&history).map_err(|e| e.to_string())?)];
     let mut layers = std::collections::HashSet::new();
     let mut files = std::collections::HashSet::new();
     for rec in s.project.gp_history.iter().filter(|r| r.ok) {
@@ -1116,6 +1128,9 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
             if moves > 0 {
                 s.notify(format!("{moves} saved label move(s) left out of the template, which keeps no features"), false);
             }
+            // As a package: what it reads keeps its plain address, what it records no binding.
+            crate::project::strip_addresses(t.addresses_mut());
+            crate::project::clear_login_bindings(t.recorded_mut());
             if let Some(n) = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
                 t.name = n.chars().take(200).collect();
             }
@@ -1129,8 +1144,13 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
         "gpPackage" => ("results".to_string(), package_gp(s)?),
         "bookmarks" => (format!("{} bookmarks", s.map().name), super::navigate::bookmarks_file(s.map())?),
         "task" => {
-            let t = task_ref(s, p)?;
-            (t.name.clone(), to_json(t)?)
+            let mut t = task_ref(s, p)?.clone();
+            let mut addresses = Vec::new();
+            for step in &mut t.steps {
+                crate::project::recorded_addresses(&mut step.params, &mut addresses);
+            }
+            crate::project::clear_login_bindings(addresses);
+            (t.name.clone(), to_json(&t)?)
         }
         "obj" => {
             let id = s.layer_id(p)?;
