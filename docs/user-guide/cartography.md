@@ -488,7 +488,7 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   spot nearby, and a line is drawn from its feature to the text, as QGIS's callouts. **at most**
   sets how long the line may be (5 to 500 points, 40 to start with): a label with no free spot
   that close is left out, or drawn over the others with Show all labels. The line takes the
-  label's colour, over its halo. Labels along lines aren't moved
+  label's colour, over its halo. Labels along lines and labels with an icon aren't moved
   (`labels.placement={"layer": "Cities", "callout": 60}`; `true` keeps the length, `false` turns
   them off).
 - **Move Label** (Labeling tab › Label Placement): drag a label to where it should be, as with
