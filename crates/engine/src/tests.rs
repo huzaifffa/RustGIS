@@ -3352,6 +3352,23 @@ fn moved_labels_of_removed_features_make_room_with_a_notice() {
     assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("dropped to make room")));
 }
 
+/// A label moved where the map's projection can't draw it is kept, and said not to be drawn;
+/// one moved inside it gets no notice.
+#[test]
+fn a_label_moved_outside_the_projection_says_so() {
+    let mut s = world();
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let fid = s.map().layer(id).unwrap().dataset.features.first().unwrap().id;
+    s.run("map.projection", &json!({"type": "usaAlbers"})).unwrap();
+    let mark = s.notice_mark();
+    s.run("labels.move", &json!({"layer": id, "feature": fid, "to": [-100.0, 40.0]})).unwrap();
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("isn't drawn")), "inside: no notice");
+    let mark = s.notice_mark();
+    s.run("labels.move", &json!({"layer": id, "feature": fid, "to": [12.5, 41.9]})).unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("outside the area the map's projection")));
+    assert_eq!(s.map().layer(id).unwrap().labels.default.moved.len(), 1, "kept");
+}
+
 /// Labels are moved by hand by feature id and put back, one class's or all; bad input is refused.
 #[test]
 fn labels_are_moved_by_command_and_reset() {

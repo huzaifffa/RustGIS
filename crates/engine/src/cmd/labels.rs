@@ -274,6 +274,20 @@ pub fn commands() -> Vec<C> {
             if pruned > 0 {
                 s.notify(format!("{pruned} saved label move(s) of features no longer in the layer dropped to make room"), false);
             }
+            // Kept, as the map's projection may change, but said: where the flat map's projection
+            // can't draw it, the label isn't drawn.
+            if let Some([x, y]) = to
+                && !s.map().projection.is_globe()
+                && s.map().to_map(Coord::new(x, y)).is_none()
+            {
+                s.notify(
+                    format!(
+                        "the label moved to ({x}, {y}) is outside the area the map's projection ({}) draws, so it isn't drawn in it",
+                        s.map().projection.label()
+                    ),
+                    false,
+                );
+            }
             // Locked, the labels are locked again where they are placed next (`with_labels`: the
             // moves changed), as the one moved may not have been placed when the lock was taken.
             Ok(r)
